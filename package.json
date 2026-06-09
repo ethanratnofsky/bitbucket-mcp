@@ -1,0 +1,40 @@
+{
+  "name": "bitbucket-mcp",
+  "version": "2.1.0",
+  "description": "Bitbucket Cloud MCP server: read tools plus an audited, allowlisted set of PR write tools — comment (general, inline, multi-line, @-mention, reply), approve / request-changes / withdraw, and create. No merge/decline/edit/delete, by construction.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "author": "Ethan Ratnofsky",
+  "bin": {
+    "bitbucket-mcp": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.mjs && node test-tools.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "bitbucket",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "pull-request",
+    "code-review",
+    "atlassian"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ethanratnofsky/bitbucket-mcp.git"
+  },
+  "homepage": "https://github.com/ethanratnofsky/bitbucket-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/ethanratnofsky/bitbucket-mcp/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  }
+}
