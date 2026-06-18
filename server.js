@@ -86,6 +86,8 @@ const LIST_MAX_PAGES = 5; // bound auto-pagination of list endpoints (safety)
 const DIFFSTAT_PAGELEN = 500; // Bitbucket default; max 5000
 const MAX_DIFFSTAT_PAGES = 10; // safety cap when following `next` links
 const DEFAULT_MAX_DIFF_CHARS = 200_000;
+const MAX_FILE_CHARS = 50_000; // cap one get_file result so it stays under the agent's tool-output budget
+const DEFAULT_LINE_COUNT = 400; // window size when get_file is given start_line without line_count
 const MAX_REDIRECTS = 5; // diff/diffstat 302 once; this is headroom + a loop guard
 const TIMEOUT_MS = Number(process.env.BITBUCKET_TIMEOUT_MS) || 30_000;
 const MAX_RETRIES = 3; // GET only; writes are never auto-retried
@@ -309,6 +311,43 @@ export function encodeRepoPath(path) {
     .filter((s) => s.length > 0);
   if (segments.some((s) => s === "..")) throw new Error("path must not contain '..' segments");
   return segments.map(enc).join("/");
+}
+
+/**
+ * Bound a file's text for a single `get_file` read so it never exceeds the agent's
+ * tool-output budget (an over-large result gets silently truncated by the client,
+ * which the model reads as "file too large" and skips). When `startLine` (1-based)
+ * or `lineCount` is given, return just that window; otherwise return the whole file.
+ * Either way the result is hard-capped at MAX_FILE_CHARS, cut at a line boundary,
+ * and — whenever anything was withheld — a trailing note states the shown range,
+ * the total line count, and how to page (start_line + line_count). A small file
+ * read in full is returned verbatim with no note. Exported for tests.
+ */
+export function sliceFile(text, startLine, lineCount) {
+  const lines = String(text).split("\n");
+  const total = lines.length;
+  const ranged = startLine !== undefined || lineCount !== undefined;
+  const from = Math.max(1, startLine ?? 1);
+  if (from > total) {
+    return `[bitbucket-mcp] start_line ${from} is past the end of the file (${total} line${total === 1 ? "" : "s"}).`;
+  }
+  const count = lineCount ?? (ranged ? DEFAULT_LINE_COUNT : total);
+  const start0 = from - 1;
+  let body = lines.slice(start0, start0 + count).join("\n");
+  let truncated = false;
+  if (body.length > MAX_FILE_CHARS) {
+    body = body.slice(0, MAX_FILE_CHARS);
+    const lastNl = body.lastIndexOf("\n");
+    if (lastNl > 0) body = body.slice(0, lastNl); // don't cut mid-line
+    truncated = true;
+  }
+  const to = start0 + body.split("\n").length;
+  if (!ranged && !truncated && to >= total) return body; // whole small file — verbatim
+  const note =
+    `\n\n[bitbucket-mcp] Showing lines ${from}-${to} of ${total}.` +
+    (truncated ? " Output was capped to fit the read budget." : "") +
+    " Pass start_line and line_count to read another range.";
+  return body + note;
 }
 
 /**
@@ -757,15 +796,31 @@ server.registerTool(
   "get_file",
   {
     title: "Get file contents",
-    description: "Read the contents of a file from a repository. If 'ref' is omitted, the repo's main branch is used.",
+    description:
+      "Read the contents of a file from a repository. If 'ref' is omitted, the repo's main branch is used. " +
+      `Large files are capped at ~${MAX_FILE_CHARS.toLocaleString()} chars; to read past the cap (or to focus on one area), ` +
+      "pass 'start_line' (1-based) and 'line_count' — the PR diff already tells you which lines changed. The result " +
+      "notes the shown range and total line count when anything is withheld.",
     inputSchema: {
       workspace: slug,
       repo: slug,
       path: z.string().describe("File path within the repo, e.g. 'src/index.ts'"),
       ref: z.string().optional().describe("Branch name, tag, or commit hash (defaults to the main branch)"),
+      start_line: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based first line to return (for large files). Omit to start at the top."),
+      line_count: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(`How many lines to return from start_line (default ${DEFAULT_LINE_COUNT} when start_line is set).`),
     },
   },
-  wrap(async ({ workspace, repo, path, ref }) => {
+  wrap(async ({ workspace, repo, path, ref, start_line, line_count }) => {
     let commit = ref;
     if (!commit) {
       const repoInfo = await bbGet(`/repositories/${enc(workspace)}/${enc(repo)}`);
@@ -774,7 +829,7 @@ server.registerTool(
     }
     const cleanPath = encodeRepoPath(path);
     const text = await bbGet(`/repositories/${enc(workspace)}/${enc(repo)}/src/${enc(commit)}/${cleanPath}`, { raw: true });
-    return okText(text);
+    return okText(sliceFile(text, start_line, line_count));
   })
 );
 

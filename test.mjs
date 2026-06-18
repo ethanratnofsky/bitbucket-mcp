@@ -15,7 +15,9 @@
 process.env.ATLASSIAN_USER_EMAIL ||= "test@example.com";
 process.env.ATLASSIAN_API_TOKEN ||= "dummy-token";
 
-const { isWriteAllowed, toReviewer, slug, buildInline, encodeRepoPath } = await import("./server.js");
+const { isWriteAllowed, toReviewer, slug, buildInline, encodeRepoPath, sliceFile } = await import(
+  "./server.js"
+);
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -96,6 +98,23 @@ check("strips leading slashes", encodeRepoPath("/src/index.ts"), "src/index.ts")
 check("encodes spaces and specials", encodeRepoPath("src/my file#1.ts"), "src/my%20file%231.ts");
 check("preserves nested slashes", encodeRepoPath("a/b/c/d.ts"), "a/b/c/d.ts");
 throws("rejects a '..' segment", () => encodeRepoPath("src/../secret"));
+
+process.stdout.write("sliceFile (whole-file passthrough, line windows, cap, past-EOF):\n");
+const small = "L1\nL2\nL3";
+check("small whole file returned verbatim", sliceFile(small), small);
+check("no note on a small whole-file read", sliceFile(small).includes("[bitbucket-mcp]"), false);
+check("empty file returned verbatim", sliceFile(""), "");
+const five = "L1\nL2\nL3\nL4\nL5";
+check("ranged read returns just the window", sliceFile(five, 2, 2).startsWith("L2\nL3"), true);
+check("ranged read notes the shown range", sliceFile(five, 2, 2).includes("Showing lines 2-3 of 5"), true);
+const big = Array.from({ length: 500 }, (_, i) => `x${i + 1}`).join("\n");
+check("start_line without line_count uses the default window", sliceFile(big, 10).includes("Showing lines 10-409 of 500"), true);
+const huge = Array.from({ length: 1000 }, () => "y".repeat(100)).join("\n");
+const capped = sliceFile(huge);
+check("oversized file is capped", capped.includes("capped to fit the read budget"), true);
+check("capped output stays near the char limit", capped.length < 51_000, true);
+check("capped output cut at a line boundary", capped.split("\n\n[bitbucket-mcp]")[0].endsWith("y".repeat(100)), true);
+check("start_line past EOF is reported, not empty", sliceFile(five, 99).includes("past the end of the file (5 lines)"), true);
 
 if (failures) {
   process.stderr.write(`\n${failures} test(s) FAILED.\n`);
