@@ -21,6 +21,7 @@ const EXPECTED = [
   "list_branches",
   "list_workspace_members",
   "get_file",
+  "list_directory",
   "create_pull_request_comment",
   "review_pull_request",
   "create_pull_request",

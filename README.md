@@ -59,7 +59,7 @@ What each scope covers in this server:
 | Scope | Tools / calls it enables |
 | --- | --- |
 | `read:pullrequest:bitbucket` | `list_pull_requests`, `get_pull_request`, `get_pull_request_comments`, and the PR `diff`/`diffstat` endpoints |
-| `read:repository:bitbucket` | `get_file`, `get_pull_request_template`, `list_repositories`, `list_branches`, repo lookups, **and the diff/diffstat 302 redirect target** — the diff tool 403s on the redirect without it, *even with* the PR scope |
+| `read:repository:bitbucket` | `get_file`, `list_directory`, `get_pull_request_template`, `list_repositories`, `list_branches`, repo lookups, **and the diff/diffstat 302 redirect target** — the diff tool 403s on the redirect without it, *even with* the PR scope |
 | `read:workspace:bitbucket` | `list_workspace_members` (look up account_ids to @-mention or add as reviewers) |
 | `write:pullrequest:bitbucket` | `review_pull_request` (approve / request-changes / withdraw) and `create_pull_request` |
 
@@ -127,6 +127,7 @@ Fully quit and relaunch Claude Desktop (config changes load only on a full resta
 | `list_branches` | read | Branches in a repo, optional name filter |
 | `list_workspace_members` | read | Find users (account_id + ready-to-paste `@{…}` mention) to tag or add as reviewers |
 | `get_file` | read | Read a file at a branch/tag/commit (defaults to main branch) |
+| `list_directory` | read | List files/subdirectories at a path (defaults to root) so you can discover real paths instead of guessing; `max_depth` recurses a few levels |
 | `create_pull_request_comment` | **write** | Comment on a PR — general, inline, multi-line, @-mention, or reply |
 | `review_pull_request` | **write** | Approve, request changes, or withdraw either |
 | `create_pull_request` | **write** | Open a PR (auto-applies a repo PR template when no description is given) |

@@ -15,9 +15,8 @@
 process.env.ATLASSIAN_USER_EMAIL ||= "test@example.com";
 process.env.ATLASSIAN_API_TOKEN ||= "dummy-token";
 
-const { isWriteAllowed, toReviewer, slug, buildInline, encodeRepoPath, sliceFile } = await import(
-  "./server.js"
-);
+const { isWriteAllowed, toReviewer, slug, buildInline, encodeRepoPath, sliceFile, mapDirEntries } =
+  await import("./server.js");
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -115,6 +114,18 @@ check("oversized file is capped", capped.includes("capped to fit the read budget
 check("capped output stays near the char limit", capped.length < 51_000, true);
 check("capped output cut at a line boundary", capped.split("\n\n[bitbucket-mcp]")[0].endsWith("y".repeat(100)), true);
 check("start_line past EOF is reported, not empty", sliceFile(five, 99).includes("past the end of the file (5 lines)"), true);
+
+process.stdout.write("mapDirEntries (Bitbucket src listing → {path,type,size?}):\n");
+check("maps a file with size", mapDirEntries([{ type: "commit_file", path: "a.ts", size: 12 }]), [{ path: "a.ts", type: "file", size: 12 }]);
+check("maps a directory (no size)", mapDirEntries([{ type: "commit_directory", path: "src" }]), [{ path: "src", type: "directory" }]);
+check(
+  "mixed listing preserves order",
+  mapDirEntries([{ type: "commit_directory", path: "src" }, { type: "commit_file", path: "README.md", size: 3 }]),
+  [{ path: "src", type: "directory" }, { path: "README.md", type: "file", size: 3 }]
+);
+check("file without a numeric size omits size", mapDirEntries([{ type: "commit_file", path: "x" }]), [{ path: "x", type: "file" }]);
+check("unknown entry type falls back to file", mapDirEntries([{ type: "commit_pr_thing", path: "y" }]), [{ path: "y", type: "file" }]);
+check("nullish values yield an empty list", mapDirEntries(undefined), []);
 
 if (failures) {
   process.stderr.write(`\n${failures} test(s) FAILED.\n`);

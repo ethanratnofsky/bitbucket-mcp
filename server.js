@@ -88,6 +88,7 @@ const MAX_DIFFSTAT_PAGES = 10; // safety cap when following `next` links
 const DEFAULT_MAX_DIFF_CHARS = 200_000;
 const MAX_FILE_CHARS = 50_000; // cap one get_file result so it stays under the agent's tool-output budget
 const DEFAULT_LINE_COUNT = 400; // window size when get_file is given start_line without line_count
+const MAX_DIR_DEPTH = 5; // ceiling for list_directory recursion — a bounded shallow tree, never the whole repo
 const MAX_REDIRECTS = 5; // diff/diffstat 302 once; this is headroom + a loop guard
 const TIMEOUT_MS = Number(process.env.BITBUCKET_TIMEOUT_MS) || 30_000;
 const MAX_RETRIES = 3; // GET only; writes are never auto-retried
@@ -311,6 +312,24 @@ export function encodeRepoPath(path) {
     .filter((s) => s.length > 0);
   if (segments.some((s) => s === "..")) throw new Error("path must not contain '..' segments");
   return segments.map(enc).join("/");
+}
+
+/**
+ * Normalize Bitbucket Source directory entries into the shape list_directory
+ * returns. Each raw value becomes `{ path, type }` where type is "directory" for
+ * a `commit_directory` and "file" for anything else (`commit_file`) — an unknown
+ * type falls back to "file" so the agent can still get_file it. A file's byte
+ * `size` is carried through when Bitbucket reports it as a number; directories
+ * carry no size. Null/undefined input yields []. Exported for tests (pure — no
+ * network).
+ */
+export function mapDirEntries(values) {
+  return (values ?? []).map((v) => {
+    const type = v?.type === "commit_directory" ? "directory" : "file";
+    const entry = { path: v?.path, type };
+    if (type === "file" && typeof v?.size === "number") entry.size = v.size;
+    return entry;
+  });
 }
 
 /**
@@ -830,6 +849,55 @@ server.registerTool(
     const cleanPath = encodeRepoPath(path);
     const text = await bbGet(`/repositories/${enc(workspace)}/${enc(repo)}/src/${enc(commit)}/${cleanPath}`, { raw: true });
     return okText(sliceFile(text, start_line, line_count));
+  })
+);
+
+server.registerTool(
+  "list_directory",
+  {
+    title: "List directory contents",
+    description:
+      "List the files and subdirectories at a path in a repository, so you can discover REAL file paths instead of guessing them. " +
+      "When a get_file read comes back not-found, do NOT keep trying speculative paths — call this on the parent directory (or the repo root, then narrow) to see what actually exists, then get_file the right entry. " +
+      "It works for any language or layout, and for targets that are not imports at all (a CSS custom property's stylesheet, a config file, a generated artifact). " +
+      "'path' defaults to the repo root; omit it to list the top level. Set 'max_depth' > 1 to recurse a few levels when you need to locate something under a subtree. " +
+      "If 'ref' is omitted the repo's main branch is used. Returns each entry's 'path' and 'type' ('file' | 'directory') — names only; use get_file to read a file's contents.",
+    inputSchema: {
+      workspace: slug,
+      repo: slug,
+      path: z.string().optional().describe("Directory path within the repo, e.g. 'src/components'. Omit for the repo root."),
+      ref: z.string().optional().describe("Branch name, tag, or commit hash (defaults to the main branch)"),
+      max_depth: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_DIR_DEPTH)
+        .optional()
+        .describe(`Recurse this many levels (1-${MAX_DIR_DEPTH}, default 1 = just this directory).`),
+      limit: z
+        .number()
+        .int()
+        .optional()
+        .describe(`Max entries (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
+    },
+  },
+  wrap(async ({ workspace, repo, path, ref, max_depth, limit }) => {
+    let commit = ref;
+    if (!commit) {
+      const repoInfo = await bbGet(`/repositories/${enc(workspace)}/${enc(repo)}`);
+      commit = repoInfo.mainbranch?.name;
+      if (!commit) return fail("Could not determine the repository's main branch; pass 'ref' explicitly.");
+    }
+    // The Source API lists a directory when the path ends in "/" (the repo root is
+    // just the commit + "/"). A trailing slash is the documented, redirect-free way
+    // to get a listing; a file path with it 404s (caught by wrap) — use get_file.
+    const cleanPath = encodeRepoPath(path ?? "");
+    const dirUrl = `/repositories/${enc(workspace)}/${enc(repo)}/src/${enc(commit)}/${cleanPath ? `${cleanPath}/` : ""}`;
+    const params = {};
+    if (max_depth && max_depth > 1) params.max_depth = Math.min(max_depth, MAX_DIR_DEPTH);
+    const { values, has_more } = await bbGetAll(dirUrl, { params, limit: clampLimit(limit) });
+    const entries = mapDirEntries(values);
+    return ok({ path: path ?? "", ref: commit, count: entries.length, has_more, entries });
   })
 );
 
