@@ -539,7 +539,7 @@ const wrap = (fn) => async (args) => {
 // slashes and rely on enc() to encode them.
 export const slug = z.string().regex(/^[^/]+$/, "must not contain '/'");
 
-const server = new McpServer({ name: "bitbucket", version: "2.1.0" });
+const server = new McpServer({ name: "Bitbucket", version: "2.1.0" });
 
 // ============================ READ TOOLS ============================
 

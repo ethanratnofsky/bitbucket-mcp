@@ -100,7 +100,7 @@ Edit `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "bitbucket": {
+    "Bitbucket": {
       "command": "node",
       "args": ["/absolute/path/to/bitbucket-mcp/server.js"],
       "env": {
