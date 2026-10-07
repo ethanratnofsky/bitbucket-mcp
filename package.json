@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node test.mjs && node test-tools.mjs"
+    "test": "node test.mjs && node test-tools.mjs && node test-handlers.mjs"
   },
   "engines": {
     "node": ">=18"
