@@ -109,11 +109,31 @@ check("traversal toward merge", isWriteAllowed("POST", `${WS}/42/approve/../merg
 check("merge approvals (different repo path depth)", isWriteAllowed("POST", "/repositories/ws/repo/pullrequests/42/merge"), false);
 check("workspace-level write", isWriteAllowed("POST", "/repositories/acme"), false);
 
-process.stdout.write("slug input invariant (workspace/repo cannot contain '/'):\n");
+process.stdout.write("write allowlist — REFUSED: paths the URL parser would rewrite:\n");
+check(
+  "'..' workspace → snippet comment PUT",
+  isWriteAllowed("PUT", "/repositories/../snippets/pullrequests/42/comments/5", { content: { raw: "x" } }),
+  false
+);
+check("'..' workspace → snippet comment POST", isWriteAllowed("POST", "/repositories/../snippets/pullrequests/42/comments"), false);
+check("'.' repo → create-repository POST", isWriteAllowed("POST", "/repositories/victim/./pullrequests"), false);
+check("'..' repo → update-repository PUT", isWriteAllowed("PUT", "/repositories/acme/../pullrequests/42", { title: "t" }), false);
+check("%2e%2e segment", isWriteAllowed("PUT", "/repositories/%2e%2e/snippets/pullrequests/42/comments/5", { content: { raw: "x" } }), false);
+check("%2E segment (upper case)", isWriteAllowed("POST", "/repositories/victim/%2E/pullrequests"), false);
+check("backslash treated as a slash", isWriteAllowed("POST", "/repositories/a\\..\\b/repo/pullrequests"), false);
+check("query string smuggled into the path", isWriteAllowed("POST", `${WS}?x=1`), false);
+check("still allows a percent-encoded uuid slug", isWriteAllowed("POST", `/repositories/${encodeURIComponent("{504c3b62-8120-4f0c-a7bc-87800b9d6f70}")}/r/pullrequests/1/comments`), true);
+check("still allows a dotted (non-dot-segment) slug", isWriteAllowed("POST", "/repositories/acme/my.repo/pullrequests/1/approve"), true);
+
+process.stdout.write("slug input invariant (workspace/repo cannot contain '/' or be a dot segment):\n");
 check("accepts a plain slug", slug.safeParse("acme").success, true);
 check("accepts a brace-wrapped uuid", slug.safeParse("{504c3b62-8120-4f0c-a7bc-87800b9d6f70}").success, true);
+check("accepts a slug containing dots", slug.safeParse("my.repo").success, true);
+check("accepts '...' (not a dot segment)", slug.safeParse("...").success, true);
 check("rejects a slash (path injection)", slug.safeParse("repo/42/merge").success, false);
 check("rejects an encoded-looking slash payload", slug.safeParse("a/b").success, false);
+check("rejects '.'", slug.safeParse(".").success, false);
+check("rejects '..'", slug.safeParse("..").success, false);
 
 process.stdout.write("toReviewer parsing:\n");
 check("account_id with colon", toReviewer("557058:f0c3abcd-1234-5678-9abc-def012345678"), { account_id: "557058:f0c3abcd-1234-5678-9abc-def012345678" });
@@ -261,7 +281,18 @@ throws("rejects removing someone who isn't a reviewer", () => buildPullRequestUp
 throws("rejects adding and removing the same person", () =>
   buildPullRequestUpdate(PR, { add_reviewers: ["557058:alice"], remove_reviewers: ["557058:alice"] })
 );
+throws("rejects adding by account_id and removing by UUID (same person)", () =>
+  buildPullRequestUpdate(PR, { add_reviewers: ["557058:alice"], remove_reviewers: [ALICE.uuid] })
+);
 throws("rejects a reviewer given as an email", () => buildPullRequestUpdate(PR, { add_reviewers: ["carol@example.com"] }));
+const PR_WITH_BODY = { ...PR, summary: { raw: "Existing body" }, description: "Existing body" };
+check(
+  "title only on a PR with a description: echoes the description",
+  buildPullRequestUpdate(PR_WITH_BODY, { title: "New" }).body,
+  { title: "New", description: "Existing body", reviewers: [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }] }
+);
+check("echoed description isn't reported as updated", buildPullRequestUpdate(PR_WITH_BODY, { title: "New" }).updated, ["title"]);
+check("explicit description wins over the current one", buildPullRequestUpdate(PR_WITH_BODY, { description: "" }).body.description, "");
 
 process.stdout.write("findUnexpectedChanges (tripwire for fields an update reset without being asked):\n");
 const BEFORE = {
@@ -278,13 +309,11 @@ check("reviewer order doesn't matter", findUnexpectedChanges(BEFORE, { ...BEFORE
 check(
   "a wiped description is flagged with its old value",
   findUnexpectedChanges(BEFORE, { ...BEFORE, summary: { raw: "" } }, ["title"]),
-  [{ field: "description", before: "D", after: "" }]
+  [{ field: "description", before: "D", after: "", restore: "with update_pull_request, using the 'before' value" }]
 );
-check(
-  "dropped reviewers and a reset close_source_branch are flagged",
-  findUnexpectedChanges(BEFORE, { ...BEFORE, reviewers: [], close_source_branch: false }, ["title"]).map((c) => c.field),
-  ["reviewers", "close_source_branch"]
-);
+const dropped = findUnexpectedChanges(BEFORE, { ...BEFORE, reviewers: [], close_source_branch: false }, ["title"]);
+check("dropped reviewers and a reset close_source_branch are flagged", dropped.map((c) => c.field), ["reviewers", "close_source_branch"]);
+check("close_source_branch says it can only be restored in the UI", dropped[1].restore.includes("Bitbucket UI"), true);
 
 process.stdout.write("buildCommentThreads (flat comments → nested threads):\n");
 check(

@@ -36,9 +36,11 @@
  *     (and body fields) are not in the allowlist, so bbWrite refuses them even if a
  *     future code change or a malicious prompt tries to build the request. The ids
  *     in each allowlisted path are constrained to digits; the workspace/repo
- *     segments cannot contain a slash (enforced at three layers: the `slug` input
- *     schema, enc() at every call site, and the anchored allowlist regex), so the
- *     path cannot be redirected to a sub-resource like /merge or /decline.
+ *     segments cannot contain a slash or be a "." / ".." dot segment (enforced at
+ *     three layers: the `slug` input schema, enc() at every call site, and the
+ *     anchored allowlist regex), and bbWrite refuses any path the URL parser would
+ *     rewrite (collapsed dot segments, %2e, backslashes), so the path cannot be
+ *     redirected to a sub-resource like /merge or /decline, or to another endpoint.
  *   - Inline/multi-line/mention/reply comments all ride on the SAME comments POST,
  *     so they do not widen the write boundary — it stays exactly the ten endpoints
  *     above.
@@ -120,6 +122,7 @@ class BitbucketError extends Error {
     super(`Bitbucket API ${status} ${statusText} for ${where}${body ? ` — ${String(body).slice(0, 300)}` : ""}`);
     this.name = "BitbucketError";
     this.status = status;
+    this.body = body ? String(body) : ""; // the response body alone, for matching without the request path
   }
 }
 
@@ -249,10 +252,40 @@ async function bbGetAll(path, { params = {}, limit = DEFAULT_LIMIT, maxPages = L
 }
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE"]);
+const API_PATH_PREFIX = new URL(BASE).pathname; // "/2.0"
 
-// The only top-level fields update_pull_request may send. Everything else in the
-// PR schema — source, state, close_source_branch, merge_commit, … — is refused.
-const PR_UPDATE_FIELDS = ["title", "description", "reviewers", "draft", "destination"];
+// The PR fields update_pull_request may send, shared by the body allowlist, the
+// body builder, and the before/after tripwire so the three can't drift apart.
+// Everything else in the PR schema — source, state, close_source_branch,
+// merge_commit, … — is refused.
+const PR_FIELD = Object.freeze({
+  TITLE: "title",
+  DESCRIPTION: "description",
+  REVIEWERS: "reviewers",
+  DRAFT: "draft",
+  DESTINATION: "destination",
+});
+const PR_UPDATE_FIELDS = Object.values(PR_FIELD);
+// Watched by the tripwire, but deliberately NOT sendable — this server can't change it.
+const CLOSE_SOURCE_BRANCH = "close_source_branch";
+
+/**
+ * Whether `path` reaches Bitbucket exactly as written. The URL parser collapses
+ * "." and ".." segments (including their %2e forms) and turns "\" into "/", so a
+ * string like `/repositories/../snippets/pullrequests/1/comments/2` can match an
+ * allowlist pattern yet hit a different endpoint. Any path the parser would
+ * rewrite is refused.
+ * @param {string} path - Request path relative to /2.0, already percent-encoded.
+ * @returns {boolean} true only when the parsed URL keeps the API origin and exactly this path, with no query or fragment.
+ */
+const isCanonicalPath = (path) => {
+  try {
+    const url = new URL(BASE + path);
+    return url.origin === API_ORIGIN && url.pathname === API_PATH_PREFIX + path && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Whether `obj` is a non-empty plain object whose own keys all appear in `allowed`.
@@ -277,7 +310,8 @@ const hasOnlyKeys = (obj, allowed) =>
  */
 const isAllowedPullRequestUpdate = (body) =>
   hasOnlyKeys(body, PR_UPDATE_FIELDS) &&
-  (body.destination === undefined || (hasOnlyKeys(body.destination, ["branch"]) && hasOnlyKeys(body.destination.branch, ["name"])));
+  (body[PR_FIELD.DESTINATION] === undefined ||
+    (hasOnlyKeys(body[PR_FIELD.DESTINATION], ["branch"]) && hasOnlyKeys(body[PR_FIELD.DESTINATION].branch, ["name"])));
 
 /**
  * Body rule for `PUT .../comments/{cid}`: only the comment's text
@@ -293,7 +327,8 @@ const isAllowedCommentUpdate = (body) => hasOnlyKeys(body, ["content"]) && hasOn
  * `body` rule. bbWrite rejects anything that doesn't match exactly, so
  * merge/decline/delete and arbitrary targets are unreachable. The patterns are
  * anchored; `[^/]+` for the workspace/repo segments cannot swallow a slash, and
- * the PR and comment ids are constrained to digits.
+ * the PR and comment ids are constrained to digits. A "." or ".." segment would
+ * still match `[^/]+`, which is why isWriteAllowed also requires isCanonicalPath.
  */
 const WRITE_ALLOWLIST = [
   { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests$/, what: "create pull request" },
@@ -311,15 +346,16 @@ const WRITE_ALLOWLIST = [
 /**
  * Pure predicate behind the write boundary: the method and path — and, for
  * entries with a body rule, the request body — must all match one allowlist
- * entry. Exported so the boundary can be exercised by tests without making any
- * network call.
+ * entry, and the path must survive URL parsing unchanged (isCanonicalPath).
+ * Exported so the boundary can be exercised by tests without making any network
+ * call.
  * @param {string} method - HTTP method; only POST, PUT, and DELETE can ever pass.
  * @param {string} path - Request path relative to /2.0, already percent-encoded.
- * @param {unknown} [body] - The JSON body to send; checked only by entries with a body rule.
+ * @param {unknown} [body] - The parsed JSON body to send; checked only by entries with a body rule.
  * @returns {boolean} whether bbWrite may send this request.
  */
 export function isWriteAllowed(method, path, body) {
-  if (!WRITE_METHODS.has(method)) return false;
+  if (!WRITE_METHODS.has(method) || !isCanonicalPath(path)) return false;
   return WRITE_ALLOWLIST.some((e) => e.method === method && e.re.test(path) && (!e.body || e.body(body)));
 }
 
@@ -329,19 +365,29 @@ export function isWriteAllowed(method, path, body) {
  * build the request from validated arguments; the allowlist is defense-in-depth so
  * the boundary holds even if a call site is wrong. Like bbGet it uses
  * redirect:"manual" and refuses to follow a 3xx, so a write can never be
- * transparently redirected with creds attached. Handles 204 / empty-body
- * responses (DELETE) by returning null.
+ * transparently redirected with creds attached. Writes are never retried.
+ * @param {"POST"|"PUT"|"DELETE"} method - HTTP method.
+ * @param {string} path - Request path relative to /2.0, built from enc()-encoded segments.
+ * @param {{ body?: object }} [options] - `body` is sent as JSON.
+ * @returns {Promise<object|string|null>} the parsed JSON response; the raw text if it isn't JSON;
+ *   null for a 204 / empty response (DELETE).
+ * @throws {Error} when the request is outside the allowlist or Bitbucket answers with a redirect;
+ *   {BitbucketError} for any other non-2xx status.
  */
 async function bbWrite(method, path, { body } = {}) {
-  if (!isWriteAllowed(method, path, body)) {
+  // Validate exactly what goes on the wire: serialize first and check the parsed
+  // JSON, so a toJSON() or getter can't make the checked object differ from the
+  // bytes sent.
+  const json = body === undefined ? undefined : JSON.stringify(body);
+  if (!isWriteAllowed(method, path, json === undefined ? undefined : JSON.parse(json))) {
     throw new Error(
       `bbWrite refuses ${method} ${path}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
     );
   }
   const init = { method, headers: { Authorization: AUTH, Accept: "application/json" }, redirect: "manual" };
-  if (body !== undefined) {
+  if (json !== undefined) {
     init.headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(body);
+    init.body = json;
   }
   const res = await doFetch(BASE + path, init, { retry: false });
   if (res.status >= 300 && res.status < 400) {
@@ -558,11 +604,11 @@ const isSameUser = (user, ref) =>
 
 /**
  * Build the PUT body for update_pull_request from the PR as it is now plus the
- * requested changes. Only requested fields are sent, with two guards against
- * Bitbucket's under-documented PUT semantics: `title` is always sent (the current
- * one when unchanged), and `reviewers` is always sent (the current set with any
- * additions/removals applied), so editing some other field can never silently
- * drop reviewers. Exported for tests (pure — no network).
+ * requested changes. Guards against Bitbucket's under-documented PUT semantics:
+ * the title, the description, and the reviewer list (with any additions/removals
+ * applied) are ALWAYS sent — the current values when unchanged — so editing one
+ * field can never silently wipe another. `draft` and `destination` are sent only
+ * when requested. Exported for tests (pure — no network).
  * @param {object} current - The PR as returned by `GET .../pullrequests/{id}`.
  * @param {object} changes - The requested edits; omit a field to leave it alone.
  * @param {string} [changes.title] - New title.
@@ -571,49 +617,51 @@ const isSameUser = (user, ref) =>
  * @param {string[]} [changes.remove_reviewers] - account_ids/UUIDs to remove; each must currently be a reviewer.
  * @param {boolean} [changes.draft] - true converts to draft; false marks it ready for review.
  * @param {string} [changes.destination_branch] - Branch to retarget the PR to.
- * @returns {{ body: object, updated: string[] }} the request body, and the names of the fields the caller asked to change.
- * @throws {Error} when nothing was requested, a reviewer id is malformed (see toReviewer), the same person is
- *   both added and removed, or someone in remove_reviewers isn't a current reviewer.
+ * @returns {{ body: object, updated: string[] }} the request body, and the PR_FIELD names the caller asked to change.
+ * @throws {Error} when nothing was requested, a reviewer id is malformed (see toReviewer), someone in
+ *   remove_reviewers isn't a current reviewer, or the same person is both added and removed (by either id form).
  */
 export const buildPullRequestUpdate = (
   current,
   { title, description, add_reviewers = [], remove_reviewers = [], draft, destination_branch }
 ) => {
   const updated = [];
-  const body = { title: title ?? current.title };
-  if (title !== undefined) updated.push("title");
-  if (description !== undefined) {
-    body.description = description;
-    updated.push("description");
-  }
+  const body = { [PR_FIELD.TITLE]: title ?? current.title };
+  if (title !== undefined) updated.push(PR_FIELD.TITLE);
+  const nextDescription = description ?? current.summary?.raw ?? current.description;
+  if (typeof nextDescription === "string") body[PR_FIELD.DESCRIPTION] = nextDescription;
+  if (description !== undefined) updated.push(PR_FIELD.DESCRIPTION);
 
   const adds = add_reviewers.map(toReviewer);
   const removes = remove_reviewers.map(toReviewer);
-  const both = adds.find((a) => removes.some((r) => isSameUser(a, r)));
-  if (both) throw new Error(`${both.account_id ?? both.uuid} is in both add_reviewers and remove_reviewers.`);
   const currentReviewers = current.reviewers ?? [];
   const notReviewing = removes.find((r) => !currentReviewers.some((u) => isSameUser(u, r)));
   if (notReviewing) {
     const names = currentReviewers.map((u) => `${u.display_name} (${u.account_id ?? u.uuid})`).join(", ") || "none";
     throw new Error(`${notReviewing.account_id ?? notReviewing.uuid} is not a reviewer on this PR, so it can't be removed. Current reviewers: ${names}.`);
   }
+  // Resolve removals to the full current users, which carry both uuid and
+  // account_id, so someone added by one id form and removed by the other is caught.
+  const removedUsers = currentReviewers.filter((u) => removes.some((r) => isSameUser(u, r)));
+  const both = adds.find((a) => removedUsers.some((u) => isSameUser(u, a)));
+  if (both) throw new Error(`${both.account_id ?? both.uuid} is in both add_reviewers and remove_reviewers.`);
   const kept = currentReviewers
-    .filter((u) => !removes.some((r) => isSameUser(u, r)))
+    .filter((u) => !removedUsers.includes(u))
     .map((u) => (u.uuid ? { uuid: u.uuid } : u.account_id ? { account_id: u.account_id } : null))
     .filter(Boolean);
-  // Skip anyone already reviewing (matched on the full user, which carries both
-  // uuid and account_id) and duplicates within add_reviewers itself.
+  // Skip anyone already reviewing (matched on the full user) and duplicates
+  // within add_reviewers itself.
   const added = adds.filter((a, i) => !currentReviewers.some((u) => isSameUser(u, a)) && adds.findIndex((b) => isSameUser(b, a)) === i);
-  body.reviewers = [...kept, ...added];
-  if (adds.length || removes.length) updated.push("reviewers");
+  body[PR_FIELD.REVIEWERS] = [...kept, ...added];
+  if (adds.length || removes.length) updated.push(PR_FIELD.REVIEWERS);
 
   if (draft !== undefined) {
-    body.draft = draft;
-    updated.push("draft");
+    body[PR_FIELD.DRAFT] = draft;
+    updated.push(PR_FIELD.DRAFT);
   }
   if (destination_branch !== undefined) {
-    body.destination = { branch: { name: destination_branch } };
-    updated.push("destination");
+    body[PR_FIELD.DESTINATION] = { branch: { name: destination_branch } };
+    updated.push(PR_FIELD.DESTINATION);
   }
   if (!updated.length) {
     throw new Error("Nothing to update: pass at least one of title, description, add_reviewers, remove_reviewers, draft, destination_branch.");
@@ -621,33 +669,45 @@ export const buildPullRequestUpdate = (
   return { body, updated };
 };
 
-// How to read each PR field update_pull_request watches, so a before/after
-// comparison can spot a field that changed without being asked to.
+/**
+ * How to read each PR field the update tripwire watches. Each reader takes a PR
+ * as Bitbucket returns it and returns a JSON-comparable value (reviewers as a
+ * sorted list of account_ids, so order doesn't count as a change).
+ * @type {Record<string, (pr: object) => unknown>}
+ */
 const WATCHED_PR_FIELDS = {
-  title: (pr) => pr?.title,
-  description: (pr) => pr?.summary?.raw ?? pr?.description ?? "",
-  reviewers: (pr) => (pr?.reviewers ?? []).map((u) => u.account_id ?? u.uuid).sort(),
-  draft: (pr) => Boolean(pr?.draft),
-  destination: (pr) => pr?.destination?.branch?.name,
-  close_source_branch: (pr) => Boolean(pr?.close_source_branch),
+  [PR_FIELD.TITLE]: (pr) => pr?.title,
+  [PR_FIELD.DESCRIPTION]: (pr) => pr?.summary?.raw ?? pr?.description ?? "",
+  [PR_FIELD.REVIEWERS]: (pr) => (pr?.reviewers ?? []).map((u) => u.account_id ?? u.uuid).sort(),
+  [PR_FIELD.DRAFT]: (pr) => Boolean(pr?.draft),
+  [PR_FIELD.DESTINATION]: (pr) => pr?.destination?.branch?.name,
+  [CLOSE_SOURCE_BRANCH]: (pr) => Boolean(pr?.close_source_branch),
 };
 
 /**
  * List PR fields that differ between `before` and `after` although the caller
  * didn't ask to change them — a tripwire for Bitbucket's under-documented PUT
- * semantics (e.g. a partial update resetting a field it left out). Exported for
+ * semantics (e.g. a partial update resetting a field it left out). Each entry
+ * says how it can be restored: fields update_pull_request can send are restorable
+ * with another call; close_source_branch only in the Bitbucket UI. Exported for
  * tests (pure — no network).
  * @param {object} before - The PR as read just before the update.
  * @param {object} after - The PR Bitbucket returned from the update.
  * @param {string[]} updated - The fields the caller asked to change (from buildPullRequestUpdate).
- * @returns {Array<{ field: string, before: unknown, after: unknown }>} one entry per unexpected change;
- *   empty when only the requested fields moved.
+ * @returns {Array<{ field: string, before: unknown, after: unknown, restore: string }>} one entry per
+ *   unexpected change; empty when only the requested fields moved.
  */
 export const findUnexpectedChanges = (before, after, updated) =>
   Object.entries(WATCHED_PR_FIELDS)
     .filter(([field]) => !updated.includes(field))
     .map(([field, read]) => ({ field, before: read(before), after: read(after) }))
-    .filter((c) => JSON.stringify(c.before) !== JSON.stringify(c.after));
+    .filter((c) => JSON.stringify(c.before) !== JSON.stringify(c.after))
+    .map((c) => ({
+      ...c,
+      restore: PR_UPDATE_FIELDS.includes(c.field)
+        ? "with update_pull_request, using the 'before' value"
+        : "only in the Bitbucket UI — this server can't change it",
+    }));
 
 /**
  * Group flat comment summaries (from commentSummary) into threads: each root gets
@@ -735,7 +795,12 @@ const participantSummary = (p) => ({
   participated_on: p?.participated_on,
 });
 
-// account_id is what update_pull_request's add/remove_reviewers take.
+/**
+ * Compact a PR reviewer to what an agent needs to name them and to pass them to
+ * update_pull_request's add/remove_reviewers.
+ * @param {object} [u] - A user object from a PR's `reviewers`.
+ * @returns {{ display_name?: string, account_id?: string }} fields are undefined when Bitbucket omits them.
+ */
 const reviewerSummary = (u) => ({ display_name: u?.display_name, account_id: u?.account_id });
 
 const userSummary = (u) => ({
@@ -763,13 +828,15 @@ const wrap = (fn) => async (args) => {
 };
 
 // Workspace and repo slugs never contain a slash (UUIDs are brace-wrapped, also
-// slashless). Enforcing it at the input boundary makes the no-slash invariant
-// the write allowlist relies on explicit, instead of leaving it to enc() + the
-// allowlist regex alone. Do NOT apply this to ref/branch/path, which may contain
-// slashes and rely on enc() to encode them.
-export const slug = z.string().regex(/^[^/]+$/, "must not contain '/'");
+// slashless) and are never "." or ".." (enc() leaves dots alone, and the URL
+// parser would collapse such a segment — e.g. workspace ".." turns a comment PUT
+// into a snippet endpoint). Enforcing both at the input boundary makes the
+// invariant the write allowlist relies on explicit, instead of leaving it to
+// enc() + the allowlist alone. Do NOT apply this to ref/branch/path, which may
+// contain slashes and rely on enc() to encode them.
+export const slug = z.string().regex(/^(?!\.\.?$)[^/]+$/, "must not contain '/' or be '.' or '..'");
 
-const server = new McpServer({ name: "Bitbucket", version: "2.2.0" });
+export const server = new McpServer({ name: "Bitbucket", version: "2.2.0" });
 
 // ============================ READ TOOLS ============================
 
@@ -1417,12 +1484,13 @@ server.registerTool(
         ...(unexpected.length
           ? {
               unexpected_changes: unexpected,
-              warning: "Bitbucket changed fields that weren't requested (see unexpected_changes, with their previous values). Tell the user, and restore them with another update_pull_request call if they agree.",
+              warning:
+                "Bitbucket changed fields that weren't requested — see unexpected_changes for each one's previous value and how it can be restored. Tell the user before doing anything else.",
             }
           : {}),
       });
     } catch (e) {
-      if (e?.status === 400 && /reviewer/i.test(e.message)) {
+      if (e?.status === 400 && /reviewer/i.test(e.body ?? "")) {
         return fail(
           `[bitbucket-mcp] ${e.message}\nBitbucket rejected the reviewer list. A reviewer can't be the PR author, must have access to the repo, and must be an active user — and a current reviewer who has since been deactivated can make edits fail until you remove them with remove_reviewers.`
         );
