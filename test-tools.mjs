@@ -23,9 +23,23 @@ const EXPECTED = [
   "get_file",
   "list_directory",
   "create_pull_request_comment",
+  "update_pull_request_comment",
+  "resolve_pull_request_comment",
   "review_pull_request",
   "create_pull_request",
+  "update_pull_request",
 ];
+
+// The tools that can change anything in Bitbucket. Every other tool must
+// declare itself read-only.
+const WRITE_TOOLS = new Set([
+  "create_pull_request_comment",
+  "update_pull_request_comment",
+  "resolve_pull_request_comment",
+  "review_pull_request",
+  "create_pull_request",
+  "update_pull_request",
+]);
 
 const transport = new StdioClientTransport({
   command: process.execPath,
@@ -46,6 +60,9 @@ const names = tools.map((t) => t.name).sort();
 const missing = EXPECTED.filter((n) => !names.includes(n));
 const extra = names.filter((n) => !EXPECTED.includes(n));
 const noSchema = tools.filter((t) => !t.inputSchema || typeof t.inputSchema !== "object").map((t) => t.name);
+const wrongHint = tools
+  .filter((t) => t.annotations?.readOnlyHint !== !WRITE_TOOLS.has(t.name))
+  .map((t) => t.name);
 
 let failures = 0;
 const line = (cond, msg) => {
@@ -60,6 +77,7 @@ process.stdout.write(`registered ${tools.length} tools\n`);
 line(missing.length === 0, `all expected tools present${missing.length ? ` (missing: ${missing.join(", ")})` : ""}`);
 line(extra.length === 0, `no unexpected tools${extra.length ? ` (extra: ${extra.join(", ")})` : ""}`);
 line(noSchema.length === 0, `every tool has an input schema${noSchema.length ? ` (missing: ${noSchema.join(", ")})` : ""}`);
+line(wrongHint.length === 0, `every tool's readOnlyHint matches whether it writes${wrongHint.length ? ` (wrong: ${wrongHint.join(", ")})` : ""}`);
 
 if (failures) {
   process.stderr.write(`\n${failures} tool-registration check(s) FAILED.\n`);

@@ -8,31 +8,42 @@
  *     repository-level URL) are followed MANUALLY and each hop's origin is
  *     re-checked, so the Authorization header can never be sent off-host — the
  *     allowlist is authoritative, not undici's redirect behavior. Never logs creds.
- *   - Writes go through bbWrite(), which (a) only accepts POST or DELETE, (b)
- *     validates the request path against WRITE_ALLOWLIST — a small, explicit set
- *     of pull-request endpoints — before a request is made, and (c) like bbGet
- *     uses redirect:"manual" and REFUSES to follow any 3xx, so a write can never
- *     be transparently redirected to a different endpoint with creds attached.
+ *   - Writes go through bbWrite(), which (a) only accepts POST, PUT, or DELETE,
+ *     (b) validates the request path — and, for the two PUTs, the request body's
+ *     fields — against WRITE_ALLOWLIST, a small, explicit set of pull-request
+ *     endpoints, before a request is made, and (c) like bbGet uses
+ *     redirect:"manual" and REFUSES to follow any 3xx, so a write can never be
+ *     transparently redirected to a different endpoint with creds attached.
  *     The permitted writes are:
- *         POST   .../pullrequests                      create a pull request
- *         POST   .../pullrequests/{id}/comments        comment (general, inline,
- *                                                       multi-line, @-mention, or
- *                                                       reply — all the same POST)
- *         POST   .../pullrequests/{id}/approve         approve
- *         DELETE .../pullrequests/{id}/approve         un-approve
- *         POST   .../pullrequests/{id}/request-changes request changes
- *         DELETE .../pullrequests/{id}/request-changes withdraw request-changes
- *   - There is deliberately NO path that can merge, decline, edit/update a PR,
- *     delete comments, delete branches, or change repository/workspace settings.
- *     Those endpoints are not in the allowlist, so bbWrite refuses them even if a
- *     future code change or a malicious prompt tries to build the path. The id in
- *     each allowlisted path is constrained to digits; the workspace/repo segments
- *     cannot contain a slash (enforced at three layers: the `slug` input schema,
- *     enc() at every call site, and the anchored allowlist regex), so the path
- *     cannot be redirected to a sub-resource like /merge or /decline.
+ *         POST   .../pullrequests                       create a pull request
+ *         PUT    .../pullrequests/{id}                  update a PR — body limited to
+ *                                                        title, description, reviewers,
+ *                                                        draft, destination branch
+ *         POST   .../pullrequests/{id}/comments         comment (general, inline,
+ *                                                        multi-line, @-mention, or
+ *                                                        reply — all the same POST)
+ *         PUT    .../pullrequests/{id}/comments/{cid}   edit a comment — body limited
+ *                                                        to its text
+ *         POST   .../pullrequests/{id}/comments/{cid}/resolve  resolve a thread
+ *         DELETE .../pullrequests/{id}/comments/{cid}/resolve  reopen a thread
+ *         POST   .../pullrequests/{id}/approve          approve
+ *         DELETE .../pullrequests/{id}/approve          un-approve
+ *         POST   .../pullrequests/{id}/request-changes  request changes
+ *         DELETE .../pullrequests/{id}/request-changes  withdraw request-changes
+ *   - There is deliberately NO path that can merge, decline, delete a PR or a
+ *     comment, change a PR's source branch / state / close_source_branch, create or
+ *     delete branches, or change repository/workspace settings. Those endpoints
+ *     (and body fields) are not in the allowlist, so bbWrite refuses them even if a
+ *     future code change or a malicious prompt tries to build the request. The ids
+ *     in each allowlisted path are constrained to digits; the workspace/repo
+ *     segments cannot contain a slash (enforced at three layers: the `slug` input
+ *     schema, enc() at every call site, and the anchored allowlist regex), so the
+ *     path cannot be redirected to a sub-resource like /merge or /decline.
  *   - Inline/multi-line/mention/reply comments all ride on the SAME comments POST,
- *     so adding them does not widen the write boundary — it stays exactly the six
- *     endpoints above.
+ *     so they do not widen the write boundary — it stays exactly the ten endpoints
+ *     above.
+ *   - Emoji reactions on comments are NOT supported: Bitbucket Cloud's public REST
+ *     API has no reactions endpoint (only Bitbucket Data Center does).
  *
  * Robustness: every request has a timeout (BITBUCKET_TIMEOUT_MS, default 30s) so a
  * stalled connection can't hang the server; reads (GET) retry with backoff on
@@ -47,10 +58,11 @@
  *                                     diffstat 302 redirect target (without it the
  *                                     diff tool 403s even with the PR scope)
  *         read:pullrequest:bitbucket  list/get PRs, comments, PR diff endpoints,
- *                                     and posting comments
+ *                                     and posting, editing, and resolving comments
  *         read:workspace:bitbucket    list_workspace_members (and list repos)
- *         write:pullrequest:bitbucket review actions (approve/request-changes) and
- *                                     create PR  — omit for a read-only token
+ *         write:pullrequest:bitbucket review actions (approve/request-changes),
+ *                                     create PR, and update PR — omit for a
+ *                                     read-only token
  *       Read-only set = the three read:* scopes. Read+write = add write:pullrequest.
  *
  * Required environment variables:
@@ -90,6 +102,9 @@ const MAX_FILE_CHARS = 50_000; // cap one get_file result so it stays under the 
 const DEFAULT_LINE_COUNT = 400; // window size when get_file is given start_line without line_count
 const MAX_DIR_DEPTH = 5; // ceiling for list_directory recursion — a bounded shallow tree, never the whole repo
 const MAX_REDIRECTS = 5; // diff/diffstat 302 once; this is headroom + a loop guard
+const MAX_THREAD_HOPS = 20; // bound the parent walk when pointing a reply at its thread's top-level comment
+const PR_STATE_OPEN = "OPEN"; // the only state Bitbucket lets a PR be edited in
+const THREAD_ACTION = Object.freeze({ RESOLVE: "resolve", REOPEN: "reopen" });
 const TIMEOUT_MS = Number(process.env.BITBUCKET_TIMEOUT_MS) || 30_000;
 const MAX_RETRIES = 3; // GET only; writes are never auto-retried
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
@@ -233,41 +248,94 @@ async function bbGetAll(path, { params = {}, limit = DEFAULT_LIMIT, maxPages = L
   return { values: items, has_more: more };
 }
 
+const WRITE_METHODS = new Set(["POST", "PUT", "DELETE"]);
+
+// The only top-level fields update_pull_request may send. Everything else in the
+// PR schema — source, state, close_source_branch, merge_commit, … — is refused.
+const PR_UPDATE_FIELDS = ["title", "description", "reviewers", "draft", "destination"];
+
+/**
+ * Whether `obj` is a non-empty plain object whose own keys all appear in `allowed`.
+ * @param {unknown} obj - The value to check (a request body or a nested piece of one).
+ * @param {string[]} allowed - The only keys permitted.
+ * @returns {boolean} false for null, arrays, primitives, `{}`, or any key outside `allowed`.
+ */
+const hasOnlyKeys = (obj, allowed) =>
+  obj !== null &&
+  typeof obj === "object" &&
+  !Array.isArray(obj) &&
+  Object.keys(obj).length > 0 &&
+  Object.keys(obj).every((k) => allowed.includes(k));
+
+/**
+ * Body rule for `PUT .../pullrequests/{id}`: only PR_UPDATE_FIELDS, and a
+ * `destination` may name nothing but a branch (`{ branch: { name } }`) — never a
+ * different repository or commit.
+ * @param {unknown} body - The JSON body bbWrite is about to send.
+ * @returns {boolean} true when the body stays inside the update boundary; false for
+ *   a missing/empty body or any other field.
+ */
+const isAllowedPullRequestUpdate = (body) =>
+  hasOnlyKeys(body, PR_UPDATE_FIELDS) &&
+  (body.destination === undefined || (hasOnlyKeys(body.destination, ["branch"]) && hasOnlyKeys(body.destination.branch, ["name"])));
+
+/**
+ * Body rule for `PUT .../comments/{cid}`: only the comment's text
+ * (`{ content: { raw } }`), so an edit can't re-anchor or re-parent a comment.
+ * @param {unknown} body - The JSON body bbWrite is about to send.
+ * @returns {boolean} true only for exactly `{ content: { raw } }`.
+ */
+const isAllowedCommentUpdate = (body) => hasOnlyKeys(body, ["content"]) && hasOnlyKeys(body.content, ["raw"]);
+
 /**
  * The set of write endpoints this server may touch. Each entry is a (method,
- * path-pattern) pair. bbWrite rejects anything that doesn't match exactly, so
- * merge/decline/edit/delete and arbitrary POST targets are unreachable. The
- * patterns are anchored; `[^/]+` for the workspace/repo segments cannot swallow
- * a slash, and the PR id is constrained to digits.
+ * path-pattern) pair, plus — for the PUTs, whose body decides what changes — a
+ * `body` rule. bbWrite rejects anything that doesn't match exactly, so
+ * merge/decline/delete and arbitrary targets are unreachable. The patterns are
+ * anchored; `[^/]+` for the workspace/repo segments cannot swallow a slash, and
+ * the PR and comment ids are constrained to digits.
  */
 const WRITE_ALLOWLIST = [
   { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests$/, what: "create pull request" },
+  { method: "PUT", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+$/, body: isAllowedPullRequestUpdate, what: "update PR title/description/reviewers/draft/destination" },
   { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments$/, what: "comment on PR" },
+  { method: "PUT", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments\/\d+$/, body: isAllowedCommentUpdate, what: "edit a PR comment's text" },
+  { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments\/\d+\/resolve$/, what: "resolve a comment thread" },
+  { method: "DELETE", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments\/\d+\/resolve$/, what: "reopen a comment thread" },
   { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/approve$/, what: "approve PR" },
   { method: "DELETE", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/approve$/, what: "un-approve PR" },
   { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/request-changes$/, what: "request changes on PR" },
   { method: "DELETE", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/request-changes$/, what: "withdraw request-changes on PR" },
 ];
 
-/** Pure predicate behind the write boundary. Exported so the allowlist can be
- *  exercised by tests without making any network call. */
-export function isWriteAllowed(method, path) {
-  if (method !== "POST" && method !== "DELETE") return false;
-  return WRITE_ALLOWLIST.some((e) => e.method === method && e.re.test(path));
+/**
+ * Pure predicate behind the write boundary: the method and path — and, for
+ * entries with a body rule, the request body — must all match one allowlist
+ * entry. Exported so the boundary can be exercised by tests without making any
+ * network call.
+ * @param {string} method - HTTP method; only POST, PUT, and DELETE can ever pass.
+ * @param {string} path - Request path relative to /2.0, already percent-encoded.
+ * @param {unknown} [body] - The JSON body to send; checked only by entries with a body rule.
+ * @returns {boolean} whether bbWrite may send this request.
+ */
+export function isWriteAllowed(method, path, body) {
+  if (!WRITE_METHODS.has(method)) return false;
+  return WRITE_ALLOWLIST.some((e) => e.method === method && e.re.test(path) && (!e.body || e.body(body)));
 }
 
 /**
- * The ONLY write primitive. It refuses any method other than POST/DELETE and any
- * path not in WRITE_ALLOWLIST. Callers build the path from validated arguments;
- * the allowlist is defense-in-depth so the boundary holds even if a call site is
- * wrong. Like bbGet it uses redirect:"manual" and refuses to follow a 3xx, so a
- * write can never be transparently redirected with creds attached. Handles 204 /
- * empty-body responses (DELETE) by returning null.
+ * The ONLY write primitive. It refuses any method other than POST/PUT/DELETE and
+ * any request not in WRITE_ALLOWLIST (path, and body fields for the PUTs). Callers
+ * build the request from validated arguments; the allowlist is defense-in-depth so
+ * the boundary holds even if a call site is wrong. Like bbGet it uses
+ * redirect:"manual" and refuses to follow a 3xx, so a write can never be
+ * transparently redirected with creds attached. Handles 204 / empty-body
+ * responses (DELETE) by returning null.
  */
 async function bbWrite(method, path, { body } = {}) {
-  if (!isWriteAllowed(method, path)) {
+  if (!isWriteAllowed(method, path, body)) {
     throw new Error(
-      `bbWrite refuses ${method} ${path}: not in the write allowlist. This server cannot merge, decline, edit, or delete — only create PRs, comment, approve/un-approve, and request/withdraw changes.`
+      `bbWrite refuses ${method} ${path}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
     );
   }
   const init = { method, headers: { Authorization: AUTH, Accept: "application/json" }, redirect: "manual" };
@@ -406,6 +474,22 @@ export function buildInline({ file_path, line, start_line, line_side = "new" }) 
   return inline;
 }
 
+/**
+ * Walk a reply's parent chain up to its thread's top-level comment, so a resolve
+ * aimed at a reply can name the comment Bitbucket will actually accept.
+ * @param {string} commentsPath - `/repositories/{ws}/{repo}/pullrequests/{id}/comments`, already encoded.
+ * @param {object} comment - A comment as Bitbucket returns it (`parent` is set on replies).
+ * @returns {Promise<number|null>} the top-level comment's id, or null if the chain is longer than MAX_THREAD_HOPS.
+ */
+const findThreadRootId = async (commentsPath, comment) => {
+  let c = comment;
+  for (let hop = 0; c.parent?.id !== undefined; hop++) {
+    if (hop >= MAX_THREAD_HOPS) return null;
+    c = await bbGet(`${commentsPath}/${c.parent.id}`);
+  }
+  return c.id;
+};
+
 /** Resolve a branch name to its head commit hash (so paths with slashes in the
  *  branch name don't break the Source API). Returns null if it can't resolve. */
 async function resolveBranchHash(workspace, repo, branch) {
@@ -462,6 +546,144 @@ export function toReviewer(s) {
   return { account_id: v };
 }
 
+/**
+ * Whether a Bitbucket user is the person a reviewer reference names.
+ * @param {{ uuid?: string, account_id?: string }} user - A user as Bitbucket returns it (e.g. an entry of a PR's `reviewers`).
+ * @param {{ uuid?: string, account_id?: string }} ref - A `{ uuid }` or `{ account_id }` from toReviewer.
+ * @returns {boolean} true when the uuid (case-insensitively) or the account_id matches; false when `ref` carries neither.
+ */
+const isSameUser = (user, ref) =>
+  (ref.uuid !== undefined && user?.uuid?.toLowerCase() === ref.uuid.toLowerCase()) ||
+  (ref.account_id !== undefined && user?.account_id === ref.account_id);
+
+/**
+ * Build the PUT body for update_pull_request from the PR as it is now plus the
+ * requested changes. Only requested fields are sent, with two guards against
+ * Bitbucket's under-documented PUT semantics: `title` is always sent (the current
+ * one when unchanged), and `reviewers` is always sent (the current set with any
+ * additions/removals applied), so editing some other field can never silently
+ * drop reviewers. Exported for tests (pure — no network).
+ * @param {object} current - The PR as returned by `GET .../pullrequests/{id}`.
+ * @param {object} changes - The requested edits; omit a field to leave it alone.
+ * @param {string} [changes.title] - New title.
+ * @param {string} [changes.description] - New description (Bitbucket Markdown); "" clears it.
+ * @param {string[]} [changes.add_reviewers] - account_ids/UUIDs to add; people already reviewing are skipped.
+ * @param {string[]} [changes.remove_reviewers] - account_ids/UUIDs to remove; each must currently be a reviewer.
+ * @param {boolean} [changes.draft] - true converts to draft; false marks it ready for review.
+ * @param {string} [changes.destination_branch] - Branch to retarget the PR to.
+ * @returns {{ body: object, updated: string[] }} the request body, and the names of the fields the caller asked to change.
+ * @throws {Error} when nothing was requested, a reviewer id is malformed (see toReviewer), the same person is
+ *   both added and removed, or someone in remove_reviewers isn't a current reviewer.
+ */
+export const buildPullRequestUpdate = (
+  current,
+  { title, description, add_reviewers = [], remove_reviewers = [], draft, destination_branch }
+) => {
+  const updated = [];
+  const body = { title: title ?? current.title };
+  if (title !== undefined) updated.push("title");
+  if (description !== undefined) {
+    body.description = description;
+    updated.push("description");
+  }
+
+  const adds = add_reviewers.map(toReviewer);
+  const removes = remove_reviewers.map(toReviewer);
+  const both = adds.find((a) => removes.some((r) => isSameUser(a, r)));
+  if (both) throw new Error(`${both.account_id ?? both.uuid} is in both add_reviewers and remove_reviewers.`);
+  const currentReviewers = current.reviewers ?? [];
+  const notReviewing = removes.find((r) => !currentReviewers.some((u) => isSameUser(u, r)));
+  if (notReviewing) {
+    const names = currentReviewers.map((u) => `${u.display_name} (${u.account_id ?? u.uuid})`).join(", ") || "none";
+    throw new Error(`${notReviewing.account_id ?? notReviewing.uuid} is not a reviewer on this PR, so it can't be removed. Current reviewers: ${names}.`);
+  }
+  const kept = currentReviewers
+    .filter((u) => !removes.some((r) => isSameUser(u, r)))
+    .map((u) => (u.uuid ? { uuid: u.uuid } : u.account_id ? { account_id: u.account_id } : null))
+    .filter(Boolean);
+  // Skip anyone already reviewing (matched on the full user, which carries both
+  // uuid and account_id) and duplicates within add_reviewers itself.
+  const added = adds.filter((a, i) => !currentReviewers.some((u) => isSameUser(u, a)) && adds.findIndex((b) => isSameUser(b, a)) === i);
+  body.reviewers = [...kept, ...added];
+  if (adds.length || removes.length) updated.push("reviewers");
+
+  if (draft !== undefined) {
+    body.draft = draft;
+    updated.push("draft");
+  }
+  if (destination_branch !== undefined) {
+    body.destination = { branch: { name: destination_branch } };
+    updated.push("destination");
+  }
+  if (!updated.length) {
+    throw new Error("Nothing to update: pass at least one of title, description, add_reviewers, remove_reviewers, draft, destination_branch.");
+  }
+  return { body, updated };
+};
+
+// How to read each PR field update_pull_request watches, so a before/after
+// comparison can spot a field that changed without being asked to.
+const WATCHED_PR_FIELDS = {
+  title: (pr) => pr?.title,
+  description: (pr) => pr?.summary?.raw ?? pr?.description ?? "",
+  reviewers: (pr) => (pr?.reviewers ?? []).map((u) => u.account_id ?? u.uuid).sort(),
+  draft: (pr) => Boolean(pr?.draft),
+  destination: (pr) => pr?.destination?.branch?.name,
+  close_source_branch: (pr) => Boolean(pr?.close_source_branch),
+};
+
+/**
+ * List PR fields that differ between `before` and `after` although the caller
+ * didn't ask to change them — a tripwire for Bitbucket's under-documented PUT
+ * semantics (e.g. a partial update resetting a field it left out). Exported for
+ * tests (pure — no network).
+ * @param {object} before - The PR as read just before the update.
+ * @param {object} after - The PR Bitbucket returned from the update.
+ * @param {string[]} updated - The fields the caller asked to change (from buildPullRequestUpdate).
+ * @returns {Array<{ field: string, before: unknown, after: unknown }>} one entry per unexpected change;
+ *   empty when only the requested fields moved.
+ */
+export const findUnexpectedChanges = (before, after, updated) =>
+  Object.entries(WATCHED_PR_FIELDS)
+    .filter(([field]) => !updated.includes(field))
+    .map(([field, read]) => ({ field, before: read(before), after: read(after) }))
+    .filter((c) => JSON.stringify(c.before) !== JSON.stringify(c.after));
+
+/**
+ * Group flat comment summaries (from commentSummary) into threads: each root gets
+ * a nested `replies` array, in the order the comments were given. A reply whose
+ * parent wasn't in the fetched set (e.g. cut off by `limit`) becomes a root marked
+ * `parent_not_fetched: true` rather than being dropped. Empty `replies` arrays are
+ * omitted to keep the output compact. Exported for tests (pure — no network).
+ * @param {Array<{ id: number, parent_id?: number }>} comments - Comment summaries, oldest first.
+ * @returns {Array<object>} the thread roots, each a comment summary with optional nested `replies`.
+ */
+export const buildCommentThreads = (comments) => {
+  const nodes = new Map(comments.map((c) => [c.id, { ...c, replies: [] }]));
+  const roots = [];
+  for (const c of comments) {
+    const node = nodes.get(c.id);
+    const parent = c.parent_id !== undefined ? nodes.get(c.parent_id) : undefined;
+    if (parent && parent !== node) {
+      parent.replies.push(node);
+    } else {
+      if (c.parent_id !== undefined) node.parent_not_fetched = true;
+      roots.push(node);
+    }
+  }
+  /**
+   * Drop empty `replies` arrays, depth-first, so leaf comments stay compact.
+   * @param {object} node - A thread node; mutated in place.
+   * @returns {void}
+   */
+  const prune = (node) => {
+    if (node.replies.length) node.replies.forEach(prune);
+    else delete node.replies;
+  };
+  roots.forEach(prune);
+  return roots;
+};
+
 // --- compactors: trim Bitbucket's verbose JSON to the useful fields ---
 const prSummary = (pr) => ({
   id: pr.id,
@@ -500,6 +722,7 @@ const commentSummary = (c) => ({
   parent_id: c.parent?.id, // present on replies — shows thread structure
   deleted: c.deleted || undefined,
   resolved: c.resolution ? true : undefined,
+  resolved_by: c.resolution?.user?.display_name,
   inline: c.inline ? { path: c.inline.path, from: c.inline.from, to: c.inline.to, start_from: c.inline.start_from, start_to: c.inline.start_to } : undefined,
   content: c.content?.raw,
 });
@@ -512,6 +735,9 @@ const participantSummary = (p) => ({
   participated_on: p?.participated_on,
 });
 
+// account_id is what update_pull_request's add/remove_reviewers take.
+const reviewerSummary = (u) => ({ display_name: u?.display_name, account_id: u?.account_id });
+
 const userSummary = (u) => ({
   account_id: u?.account_id,
   uuid: u?.uuid,
@@ -520,6 +746,10 @@ const userSummary = (u) => ({
   // Ready to paste into a comment's content to @-mention this person.
   mention: u?.account_id ? `@{${u.account_id}}` : undefined,
 });
+
+// MCP tool annotations: hints a client may use to decide how to present or
+// confirm a call. Every read tool shares this; each write tool states its own.
+const READ_ONLY_TOOL = Object.freeze({ readOnlyHint: true, openWorldHint: true });
 
 const ok = (data) => ({ content: [{ type: "text", text: JSON.stringify(data, null, 2) }] });
 const okText = (text) => ({ content: [{ type: "text", text }] });
@@ -539,7 +769,7 @@ const wrap = (fn) => async (args) => {
 // slashes and rely on enc() to encode them.
 export const slug = z.string().regex(/^[^/]+$/, "must not contain '/'");
 
-const server = new McpServer({ name: "Bitbucket", version: "2.1.0" });
+const server = new McpServer({ name: "Bitbucket", version: "2.2.0" });
 
 // ============================ READ TOOLS ============================
 
@@ -554,6 +784,7 @@ server.registerTool(
       state: z.enum(["OPEN", "MERGED", "DECLINED", "SUPERSEDED"]).optional().describe("PR state filter (default OPEN)"),
       limit: z.number().int().optional().describe(`Max results (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, state, limit }) => {
     const { values, has_more } = await bbGetAll(`/repositories/${enc(workspace)}/${enc(repo)}/pullrequests`, {
@@ -568,19 +799,21 @@ server.registerTool(
   "get_pull_request",
   {
     title: "Get pull request",
-    description: "Fetch details for a single pull request, including description, reviewers, and per-reviewer approval state.",
+    description:
+      "Fetch details for a single pull request, including description, reviewers (with the account_id that update_pull_request's remove_reviewers takes), and per-reviewer approval state.",
     inputSchema: {
       workspace: slug,
       repo: slug,
       pull_request_id: z.number().int().describe("Numeric PR id"),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, pull_request_id }) => {
     const pr = await bbGet(`/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}`);
     return ok({
       ...prSummary(pr),
       description: pr.summary?.raw ?? pr.description,
-      reviewers: (pr.reviewers || []).map((u) => u.display_name),
+      reviewers: (pr.reviewers || []).map(reviewerSummary),
       participants: (pr.participants || []).map((p) => ({ name: p.user?.display_name, role: p.role, approved: p.approved, state: p.state })),
     });
   })
@@ -591,19 +824,32 @@ server.registerTool(
   {
     title: "Get pull request comments",
     description:
-      "List comments on a pull request (general and inline). Each comment includes its 'id' (use it as 'parent_id' on create_pull_request_comment to reply) and, for replies, 'parent_id' so you can see thread structure.",
+      "List comments on a pull request (general and inline). Each comment includes its 'id' (use it as 'parent_id' on create_pull_request_comment to reply, or as 'comment_id' to edit or resolve) and, for replies, 'parent_id'. " +
+      "Set 'threaded' true to get them grouped into threads instead: each top-level comment with its replies nested under 'replies' — the top-level comment's id is the one resolve_pull_request_comment takes. " +
+      "'resolved' marks a resolved thread.",
     inputSchema: {
       workspace: slug,
       repo: slug,
       pull_request_id: z.number().int(),
-      limit: z.number().int().optional().describe(`Max results (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
+      limit: z.number().int().optional().describe(`Max comments to fetch (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
+      threaded: z.boolean().optional().describe("Group comments into threads (replies nested under their top-level comment). Default false: a flat list."),
     },
+    annotations: READ_ONLY_TOOL,
   },
-  wrap(async ({ workspace, repo, pull_request_id, limit }) => {
+  wrap(async ({ workspace, repo, pull_request_id, limit, threaded }) => {
     const { values, has_more } = await bbGetAll(`/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}/comments`, {
       limit: clampLimit(limit),
     });
-    return ok({ count: values.length, has_more, comments: values.map(commentSummary) });
+    const comments = values.map(commentSummary);
+    if (!threaded) return ok({ count: comments.length, has_more, comments });
+    const threads = buildCommentThreads(comments);
+    return ok({
+      count: comments.length,
+      thread_count: threads.length,
+      has_more,
+      ...(has_more ? { note: `Only the first ${comments.length} comments were fetched, so some threads may be missing replies. Raise 'limit' (max ${MAX_LIMIT}) to see more.` } : {}),
+      threads,
+    });
   })
 );
 
@@ -623,6 +869,7 @@ server.registerTool(
       include_diff: z.boolean().optional().describe("Include the raw unified diff text (default true). Set false for only the per-file summary."),
       max_diff_chars: z.number().int().optional().describe(`Truncate the raw diff beyond this many characters (default ${DEFAULT_MAX_DIFF_CHARS})`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, pull_request_id, path, context, ignore_whitespace, include_diff, max_diff_chars }) => {
     const ws = enc(workspace);
@@ -714,6 +961,7 @@ server.registerTool(
       repo: slug,
       branch: z.string().optional().describe("Branch to read the template from (defaults to the repo's main branch). Use the PR's source branch to match what Bitbucket would apply."),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, branch }) => {
     let ref = branch;
@@ -750,6 +998,7 @@ server.registerTool(
       query: z.string().optional().describe("Case-insensitive substring to match in the repo name"),
       limit: z.number().int().optional().describe(`Max results (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, query, limit }) => {
     const params = { sort: "-updated_on" };
@@ -770,6 +1019,7 @@ server.registerTool(
       query: z.string().optional().describe("Case-insensitive substring to match in the branch name"),
       limit: z.number().int().optional().describe(`Max results (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, query, limit }) => {
     const params = {};
@@ -790,6 +1040,7 @@ server.registerTool(
       query: z.string().optional().describe("Case-insensitive substring matched against display_name or nickname"),
       limit: z.number().int().optional().describe(`Max results (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT})`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, query, limit }) => {
     const want = clampLimit(limit);
@@ -838,6 +1089,7 @@ server.registerTool(
         .optional()
         .describe(`How many lines to return from start_line (default ${DEFAULT_LINE_COUNT} when start_line is set).`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, path, ref, start_line, line_count }) => {
     let commit = ref;
@@ -880,6 +1132,7 @@ server.registerTool(
         .optional()
         .describe(`Max entries (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT}); the server auto-paginates to reach it`),
     },
+    annotations: READ_ONLY_TOOL,
   },
   wrap(async ({ workspace, repo, path, ref, max_depth, limit }) => {
     let commit = ref;
@@ -926,6 +1179,7 @@ server.registerTool(
       line_side: z.enum(["new", "old"]).optional().describe("Which side of the diff the line(s) refer to: 'new' (added, default) or 'old' (removed)."),
       parent_id: z.number().int().optional().describe("Reply to this existing comment id (from get_pull_request_comments). Replies inherit the parent's anchor — omit file_path/line."),
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   wrap(async ({ workspace, repo, pull_request_id, content, file_path, line, start_line, line_side, parent_id }) => {
     const body = { content: { raw: content } };
@@ -952,6 +1206,87 @@ server.registerTool(
 );
 
 server.registerTool(
+  "update_pull_request_comment",
+  {
+    title: "Edit a pull request comment",
+    description:
+      "Replace the text of an existing pull request comment. Bitbucket only lets you edit comments YOU wrote. Only the text changes — the comment keeps its file/line anchor and its place in its thread. " +
+      "'content' replaces the old text entirely; tag users with '@{account_id}' as in create_pull_request_comment. To add to a discussion rather than rewrite it, reply with create_pull_request_comment (parent_id) instead.",
+    inputSchema: {
+      workspace: slug,
+      repo: slug,
+      pull_request_id: z.number().int(),
+      comment_id: z.number().int().describe("The comment to edit (an 'id' from get_pull_request_comments)"),
+      content: z.string().min(1).describe("The new comment text (Bitbucket Markdown). Replaces the current text entirely."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  },
+  wrap(async ({ workspace, repo, pull_request_id, comment_id, content }) => {
+    const path = `/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}/comments/${comment_id}`;
+    try {
+      const updated = await bbWrite("PUT", path, { body: { content: { raw: content } } });
+      return ok({ ...commentSummary(updated), url: updated.links?.html?.href });
+    } catch (e) {
+      if (e?.status === 403) {
+        return fail(`[bitbucket-mcp] ${e.message}\nBitbucket only lets you edit your own comments, so comment ${comment_id} probably belongs to someone else.`);
+      }
+      throw e;
+    }
+  })
+);
+
+server.registerTool(
+  "resolve_pull_request_comment",
+  {
+    title: "Resolve or reopen a comment thread",
+    description:
+      "Resolve a pull request comment thread, or reopen a resolved one. Pass the thread's TOP-LEVEL comment id: Bitbucket resolves whole threads, so a reply's id is refused with a pointer to its top-level comment (get_pull_request_comments with 'threaded' true shows which is which). " +
+      "Resolving an already-resolved thread, or reopening an open one, reports that and changes nothing. To explain why you're resolving, first reply with create_pull_request_comment (parent_id).",
+    inputSchema: {
+      workspace: slug,
+      repo: slug,
+      pull_request_id: z.number().int(),
+      comment_id: z.number().int().describe("The thread's top-level comment id (from get_pull_request_comments)"),
+      action: z.enum([THREAD_ACTION.RESOLVE, THREAD_ACTION.REOPEN]).describe("'resolve' the thread, or 'reopen' a resolved one"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  wrap(async ({ workspace, repo, pull_request_id, comment_id, action }) => {
+    const commentsPath = `/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}/comments`;
+    const resolvePath = `${commentsPath}/${comment_id}/resolve`;
+    // Read first: it catches a reply (which Bitbucket refuses with a bare 403) and
+    // lets a no-op resolve/reopen succeed without a write.
+    const comment = await bbGet(`${commentsPath}/${comment_id}`);
+    if (comment.parent?.id !== undefined) {
+      const rootId = await findThreadRootId(commentsPath, comment);
+      return fail(
+        `Comment ${comment_id} is a reply; Bitbucket only resolves a thread through its top-level comment. ` +
+          (rootId ? `Pass comment_id ${rootId} instead.` : `Follow parent_id up from comment ${comment.parent.id} to find it.`)
+      );
+    }
+    const isResolved = Boolean(comment.resolution);
+    if (action === THREAD_ACTION.RESOLVE) {
+      if (isResolved) return ok({ action, comment_id, result: "already resolved", resolved_by: comment.resolution.user?.display_name });
+      try {
+        const resolution = await bbWrite("POST", resolvePath);
+        return ok({ action, comment_id, result: "resolved", resolved_by: resolution?.user?.display_name, resolved_on: resolution?.created_on });
+      } catch (e) {
+        if (e?.status === 409) return ok({ action, comment_id, result: "already resolved" }); // resolved between our read and write
+        throw e;
+      }
+    }
+    if (!isResolved) return ok({ action, comment_id, result: "already open (nothing to reopen)" });
+    try {
+      await bbWrite("DELETE", resolvePath);
+      return ok({ action, comment_id, result: "reopened" });
+    } catch (e) {
+      if (e?.status === 404) return ok({ action, comment_id, result: "already open (nothing to reopen)" }); // reopened between our read and write
+      throw e;
+    }
+  })
+);
+
+server.registerTool(
   "review_pull_request",
   {
     title: "Review a pull request",
@@ -963,6 +1298,7 @@ server.registerTool(
       pull_request_id: z.number().int(),
       action: z.enum(["approve", "unapprove", "request-changes", "unrequest-changes"]).describe("The review action to take"),
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   wrap(async ({ workspace, repo, pull_request_id, action }) => {
     const sub = action === "approve" || action === "unapprove" ? "approve" : "request-changes";
@@ -999,6 +1335,7 @@ server.registerTool(
       draft: z.boolean().optional().describe("Create the PR as a draft (default false)"),
       use_template: z.boolean().optional().describe("When 'description' is omitted, apply the repo's PR template if one exists (default true)"),
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   wrap(async ({ workspace, repo, title, source_branch, destination_branch, description, reviewers, close_source_branch, draft, use_template }) => {
     const body = {
@@ -1040,6 +1377,61 @@ server.registerTool(
   })
 );
 
+server.registerTool(
+  "update_pull_request",
+  {
+    title: "Update a pull request",
+    description:
+      "Edit an OPEN pull request. Pass only what you want to change: 'title', 'description', 'add_reviewers' / 'remove_reviewers', 'draft' (false marks it ready for review, true converts it back to a draft), or 'destination_branch' (retarget). " +
+      "Everything else stays as it is, including current reviewers unless you remove them. 'description' REPLACES the whole description, so to change part of it, read it with get_pull_request first and send the full edited text. " +
+      "Reviewers are account_ids or UUIDs: get_pull_request lists current reviewers' account_ids, and list_workspace_members finds new ones. The PR author can't be a reviewer. " +
+      "This tool cannot merge, decline, change the source branch, or change close_source_branch.",
+    inputSchema: {
+      workspace: slug,
+      repo: slug,
+      pull_request_id: z.number().int(),
+      title: z.string().min(1).optional().describe("New PR title"),
+      description: z.string().optional().describe('New PR description in Bitbucket Markdown. Replaces the current one entirely; pass "" to clear it.'),
+      add_reviewers: z.array(z.string()).optional().describe("account_ids or UUIDs to add as reviewers (people already reviewing are skipped)"),
+      remove_reviewers: z.array(z.string()).optional().describe("account_ids or UUIDs to remove from the reviewers (each must currently be a reviewer)"),
+      draft: z.boolean().optional().describe("false marks a draft PR ready for review; true converts it back to a draft"),
+      destination_branch: z.string().min(1).optional().describe("Retarget the PR to merge into this branch"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  },
+  wrap(async ({ workspace, repo, pull_request_id, ...changes }) => {
+    const path = `/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}`;
+    const current = await bbGet(path);
+    if (current.state !== PR_STATE_OPEN) {
+      return fail(`PR #${pull_request_id} is ${current.state}; Bitbucket only allows editing OPEN pull requests.`);
+    }
+    const { body, updated } = buildPullRequestUpdate(current, changes);
+    try {
+      const pr = await bbWrite("PUT", path, { body });
+      const unexpected = findUnexpectedChanges(current, pr, updated);
+      return ok({
+        ...prSummary(pr),
+        updated,
+        description: pr.summary?.raw ?? pr.description,
+        reviewers: (pr.reviewers || []).map(reviewerSummary),
+        ...(unexpected.length
+          ? {
+              unexpected_changes: unexpected,
+              warning: "Bitbucket changed fields that weren't requested (see unexpected_changes, with their previous values). Tell the user, and restore them with another update_pull_request call if they agree.",
+            }
+          : {}),
+      });
+    } catch (e) {
+      if (e?.status === 400 && /reviewer/i.test(e.message)) {
+        return fail(
+          `[bitbucket-mcp] ${e.message}\nBitbucket rejected the reviewer list. A reviewer can't be the PR author, must have access to the repo, and must be an active user — and a current reviewer who has since been deactivated can make edits fail until you remove them with remove_reviewers.`
+        );
+      }
+      throw e;
+    }
+  })
+);
+
 // Connect to stdio only when run directly (`node server.js` or via the npm bin
 // symlink). When imported by a test, this is skipped so the module loads without
 // holding the transport open. realpathSync resolves the bin symlink to this file.
@@ -1054,5 +1446,5 @@ const invokedDirectly = (() => {
 if (invokedDirectly) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("[bitbucket-mcp] MCP server running (read + PR comment/review/create tools).\n");
+  process.stderr.write("[bitbucket-mcp] MCP server running (read + PR comment/thread/review/create/update tools).\n");
 }
