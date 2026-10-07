@@ -1,7 +1,7 @@
 {
   "name": "bitbucket-mcp",
-  "version": "2.1.0",
-  "description": "Bitbucket Cloud MCP server: read tools plus an audited, allowlisted set of PR write tools — comment (general, inline, multi-line, @-mention, reply), approve / request-changes / withdraw, and create. No merge/decline/edit/delete, by construction.",
+  "version": "2.2.0",
+  "description": "Bitbucket Cloud MCP server: read tools plus an audited, allowlisted set of PR write tools — comment (general, inline, multi-line, @-mention, reply), edit your comments, resolve / reopen threads, approve / request-changes / withdraw, create, and update (title, description, reviewers, draft, destination). No merge/decline/delete, by construction.",
   "type": "module",
   "license": "UNLICENSED",
   "author": "Ethan Ratnofsky",

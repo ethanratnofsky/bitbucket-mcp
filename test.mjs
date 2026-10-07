@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
  * Tests for the bits that matter most: the write allowlist (the security
- * boundary), reviewer parsing, the inline-comment builder (single + multi-line),
- * and the repo-path encoder. Pure functions only — no network, no creds.
+ * boundary, including the PUT body-field rules), reviewer parsing, the
+ * inline-comment builder (single + multi-line), the repo-path encoder, the
+ * PR-update body builder, and the comment-thread builder. Pure functions only —
+ * no network, no creds.
  * Run with `npm test`.
  *
  * A separate end-to-end check (that all tools register over MCP) lives in
@@ -15,8 +17,18 @@
 process.env.ATLASSIAN_USER_EMAIL ||= "test@example.com";
 process.env.ATLASSIAN_API_TOKEN ||= "dummy-token";
 
-const { isWriteAllowed, toReviewer, slug, buildInline, encodeRepoPath, sliceFile, mapDirEntries } =
-  await import("./server.js");
+const {
+  isWriteAllowed,
+  toReviewer,
+  slug,
+  buildInline,
+  encodeRepoPath,
+  sliceFile,
+  mapDirEntries,
+  buildPullRequestUpdate,
+  buildCommentThreads,
+  findUnexpectedChanges,
+} = await import("./server.js");
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -48,11 +60,45 @@ check("approve (POST .../42/approve)", isWriteAllowed("POST", `${WS}/42/approve`
 check("un-approve (DELETE .../42/approve)", isWriteAllowed("DELETE", `${WS}/42/approve`), true);
 check("request-changes (POST .../42/request-changes)", isWriteAllowed("POST", `${WS}/42/request-changes`), true);
 check("withdraw changes (DELETE .../42/request-changes)", isWriteAllowed("DELETE", `${WS}/42/request-changes`), true);
+check("update PR title (PUT .../42)", isWriteAllowed("PUT", `${WS}/42`, { title: "t" }), true);
+check(
+  "update PR, every allowed field",
+  isWriteAllowed("PUT", `${WS}/42`, {
+    title: "t",
+    description: "d",
+    reviewers: [{ uuid: "{x}" }],
+    draft: false,
+    destination: { branch: { name: "main" } },
+  }),
+  true
+);
+check("edit comment text (PUT .../42/comments/5)", isWriteAllowed("PUT", `${WS}/42/comments/5`, { content: { raw: "x" } }), true);
+check("resolve thread (POST .../42/comments/5/resolve)", isWriteAllowed("POST", `${WS}/42/comments/5/resolve`), true);
+check("reopen thread (DELETE .../42/comments/5/resolve)", isWriteAllowed("DELETE", `${WS}/42/comments/5/resolve`), true);
 
 process.stdout.write("write allowlist — REFUSED (the boundary):\n");
 check("merge", isWriteAllowed("POST", `${WS}/42/merge`), false);
 check("decline", isWriteAllowed("POST", `${WS}/42/decline`), false);
-check("edit/update PR (PUT)", isWriteAllowed("PUT", `${WS}/42`), false);
+check("update PR with no body", isWriteAllowed("PUT", `${WS}/42`), false);
+check("update PR with an empty body", isWriteAllowed("PUT", `${WS}/42`, {}), false);
+check("update PR state (merge via PUT)", isWriteAllowed("PUT", `${WS}/42`, { title: "t", state: "MERGED" }), false);
+check("update PR source branch", isWriteAllowed("PUT", `${WS}/42`, { source: { branch: { name: "x" } } }), false);
+check("update PR close_source_branch", isWriteAllowed("PUT", `${WS}/42`, { close_source_branch: true }), false);
+check("update PR destination repository", isWriteAllowed("PUT", `${WS}/42`, { destination: { repository: { full_name: "evil/repo" } } }), false);
+check("update PR destination commit", isWriteAllowed("PUT", `${WS}/42`, { destination: { branch: { name: "main" }, commit: { hash: "abc" } } }), false);
+check("update PR destination branch extra field", isWriteAllowed("PUT", `${WS}/42`, { destination: { branch: { name: "main", target: {} } } }), false);
+check("update PR body is an array", isWriteAllowed("PUT", `${WS}/42`, [{ title: "t" }]), false);
+check("PUT on the PR collection", isWriteAllowed("PUT", WS, { title: "t" }), false);
+check("PATCH a PR (wrong method)", isWriteAllowed("PATCH", `${WS}/42`, { title: "t" }), false);
+check("edit comment with no body", isWriteAllowed("PUT", `${WS}/42/comments/5`), false);
+check("edit comment re-anchor (inline)", isWriteAllowed("PUT", `${WS}/42/comments/5`, { content: { raw: "x" }, inline: { path: "a" } }), false);
+check("edit comment re-parent", isWriteAllowed("PUT", `${WS}/42/comments/5`, { content: { raw: "x" }, parent: { id: 1 } }), false);
+check("edit comment extra content field", isWriteAllowed("PUT", `${WS}/42/comments/5`, { content: { raw: "x", html: "<b>" } }), false);
+check("PUT on the comments collection", isWriteAllowed("PUT", `${WS}/42/comments`, { content: { raw: "x" } }), false);
+check("non-numeric comment id", isWriteAllowed("PUT", `${WS}/42/comments/abc`, { content: { raw: "x" } }), false);
+check("resolve with non-numeric comment id", isWriteAllowed("POST", `${WS}/42/comments/abc/resolve`), false);
+check("resolve via PUT (wrong method)", isWriteAllowed("PUT", `${WS}/42/comments/5/resolve`, { content: { raw: "x" } }), false);
+check("PUT on approve", isWriteAllowed("PUT", `${WS}/42/approve`, { title: "t" }), false);
 check("delete PR (DELETE)", isWriteAllowed("DELETE", `${WS}/42`), false);
 check("delete a comment", isWriteAllowed("DELETE", `${WS}/42/comments/5`), false);
 check("delete the PR collection", isWriteAllowed("DELETE", WS), false);
@@ -127,8 +173,153 @@ check("file without a numeric size omits size", mapDirEntries([{ type: "commit_f
 check("unknown entry type falls back to file", mapDirEntries([{ type: "commit_pr_thing", path: "y" }]), [{ path: "y", type: "file" }]);
 check("nullish values yield an empty list", mapDirEntries(undefined), []);
 
+process.stdout.write("buildPullRequestUpdate (only requested fields; title + reviewers always preserved):\n");
+const ALICE = { display_name: "Alice", account_id: "557058:alice", uuid: "{aaaaaaaa-0000-0000-0000-000000000001}" };
+const BOB = { display_name: "Bob", account_id: "557058:bob", uuid: "{bbbbbbbb-0000-0000-0000-000000000002}" };
+const PR = { title: "Old title", state: "OPEN", reviewers: [ALICE, BOB] };
+check(
+  "title only: keeps reviewers, sends nothing else",
+  buildPullRequestUpdate(PR, { title: "New" }),
+  { body: { title: "New", reviewers: [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }] }, updated: ["title"] }
+);
+check(
+  "description only: echoes the current title",
+  buildPullRequestUpdate(PR, { description: "Body" }).body,
+  { title: "Old title", description: "Body", reviewers: [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }] }
+);
+check("empty description clears it", buildPullRequestUpdate(PR, { description: "" }).body.description, "");
+check(
+  "add a reviewer appends; existing ones kept",
+  buildPullRequestUpdate(PR, { add_reviewers: ["557058:carol"] }).body.reviewers,
+  [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }, { account_id: "557058:carol" }]
+);
+check(
+  "adding someone already reviewing (by account_id) is a no-op",
+  buildPullRequestUpdate(PR, { add_reviewers: ["557058:alice"] }).body.reviewers,
+  [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }]
+);
+check(
+  "adding someone already reviewing (by bare UUID, any case) is a no-op",
+  buildPullRequestUpdate(PR, { add_reviewers: ["AAAAAAAA-0000-0000-0000-000000000001"] }).body.reviewers,
+  [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }]
+);
+check(
+  "duplicate adds collapse to one",
+  buildPullRequestUpdate(PR, { add_reviewers: ["557058:carol", "557058:carol"] }).body.reviewers,
+  [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }, { account_id: "557058:carol" }]
+);
+check(
+  "remove a reviewer by account_id",
+  buildPullRequestUpdate(PR, { remove_reviewers: ["557058:bob"] }),
+  { body: { title: "Old title", reviewers: [{ uuid: ALICE.uuid }] }, updated: ["reviewers"] }
+);
+check(
+  "remove a reviewer by UUID",
+  buildPullRequestUpdate(PR, { remove_reviewers: [ALICE.uuid] }).body.reviewers,
+  [{ uuid: BOB.uuid }]
+);
+check(
+  "remove everyone leaves an empty list (not omitted)",
+  buildPullRequestUpdate(PR, { remove_reviewers: ["557058:alice", "557058:bob"] }).body.reviewers,
+  []
+);
+check("PR with no reviewers sends an empty list", buildPullRequestUpdate({ title: "t" }, { title: "u" }).body.reviewers, []);
+check(
+  "draft false = ready for review",
+  buildPullRequestUpdate(PR, { draft: false }),
+  { body: { title: "Old title", reviewers: [{ uuid: ALICE.uuid }, { uuid: BOB.uuid }], draft: false }, updated: ["draft"] }
+);
+check(
+  "destination branch is sent as { branch: { name } } only",
+  buildPullRequestUpdate(PR, { destination_branch: "release/1.2" }).body.destination,
+  { branch: { name: "release/1.2" } }
+);
+check(
+  "every field at once",
+  buildPullRequestUpdate(PR, {
+    title: "T",
+    description: "D",
+    add_reviewers: ["557058:carol"],
+    remove_reviewers: ["557058:bob"],
+    draft: true,
+    destination_branch: "dev",
+  }).updated,
+  ["title", "description", "reviewers", "draft", "destination"]
+);
+check(
+  "every body it builds passes the allowlist",
+  isWriteAllowed(
+    "PUT",
+    `${WS}/42`,
+    buildPullRequestUpdate(PR, { title: "T", description: "D", add_reviewers: ["557058:carol"], draft: true, destination_branch: "dev" }).body
+  ),
+  true
+);
+throws("rejects an empty update", () => buildPullRequestUpdate(PR, {}));
+throws("rejects empty reviewer arrays as the only change", () => buildPullRequestUpdate(PR, { add_reviewers: [], remove_reviewers: [] }));
+throws("rejects removing someone who isn't a reviewer", () => buildPullRequestUpdate(PR, { remove_reviewers: ["557058:carol"] }));
+throws("rejects adding and removing the same person", () =>
+  buildPullRequestUpdate(PR, { add_reviewers: ["557058:alice"], remove_reviewers: ["557058:alice"] })
+);
+throws("rejects a reviewer given as an email", () => buildPullRequestUpdate(PR, { add_reviewers: ["carol@example.com"] }));
+
+process.stdout.write("findUnexpectedChanges (tripwire for fields an update reset without being asked):\n");
+const BEFORE = {
+  title: "T",
+  summary: { raw: "D" },
+  reviewers: [ALICE, BOB],
+  draft: true,
+  destination: { branch: { name: "main" } },
+  close_source_branch: true,
+};
+check("nothing changed → no warnings", findUnexpectedChanges(BEFORE, BEFORE, ["title"]), []);
+check("requested changes aren't flagged", findUnexpectedChanges(BEFORE, { ...BEFORE, title: "New", draft: false }, ["title", "draft"]), []);
+check("reviewer order doesn't matter", findUnexpectedChanges(BEFORE, { ...BEFORE, reviewers: [BOB, ALICE] }, ["title"]), []);
+check(
+  "a wiped description is flagged with its old value",
+  findUnexpectedChanges(BEFORE, { ...BEFORE, summary: { raw: "" } }, ["title"]),
+  [{ field: "description", before: "D", after: "" }]
+);
+check(
+  "dropped reviewers and a reset close_source_branch are flagged",
+  findUnexpectedChanges(BEFORE, { ...BEFORE, reviewers: [], close_source_branch: false }, ["title"]).map((c) => c.field),
+  ["reviewers", "close_source_branch"]
+);
+
+process.stdout.write("buildCommentThreads (flat comments → nested threads):\n");
+check(
+  "nests replies under their root, in order",
+  buildCommentThreads([
+    { id: 1, content: "root" },
+    { id: 2, parent_id: 1, content: "reply" },
+    { id: 3, content: "other root" },
+    { id: 4, parent_id: 2, content: "reply to reply" },
+    { id: 5, parent_id: 1, content: "second reply" },
+  ]),
+  [
+    {
+      id: 1,
+      content: "root",
+      replies: [
+        { id: 2, parent_id: 1, content: "reply", replies: [{ id: 4, parent_id: 2, content: "reply to reply" }] },
+        { id: 5, parent_id: 1, content: "second reply" },
+      ],
+    },
+    { id: 3, content: "other root" },
+  ]
+);
+check(
+  "a reply whose parent wasn't fetched becomes a flagged root",
+  buildCommentThreads([{ id: 9, parent_id: 7, content: "orphan" }]),
+  [{ id: 9, parent_id: 7, content: "orphan", parent_not_fetched: true }]
+);
+check("no comments → no threads", buildCommentThreads([]), []);
+const input = [{ id: 1 }, { id: 2, parent_id: 1 }];
+buildCommentThreads(input);
+check("does not mutate its input", input, [{ id: 1 }, { id: 2, parent_id: 1 }]);
+
 if (failures) {
   process.stderr.write(`\n${failures} test(s) FAILED.\n`);
   process.exit(1);
 }
-process.stdout.write("\nAll allowlist / reviewer / inline / path tests passed.\n");
+process.stdout.write("\nAll allowlist / reviewer / inline / path / update / thread tests passed.\n");
