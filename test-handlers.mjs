@@ -223,6 +223,9 @@ check("nests a reply to a reply", r.json?.threads?.[0]?.replies?.[0]?.replies?.m
 check("marks the resolved thread", r.json?.threads?.[1]?.resolved, true);
 r = await call("get_pull_request_comments", { ...BASE, pull_request_id: 45, threaded: true });
 check("a listing that repeats a comment id doesn't crash, and keeps it once", [r.isError, r.json?.threads?.[0]?.replies?.map((x) => x.id)], [false, [2]]);
+check("…and the threaded count counts it once", r.json?.count, 3);
+r = await call("get_pull_request_comments", { ...BASE, pull_request_id: 45 });
+check("the flat view drops the repeat too, and counts it once", [r.json?.count, r.json?.comments?.map((c) => c.id)], [3, [1, 2, 4]]);
 
 process.stdout.write("get_pull_request:\n");
 r = await call("get_pull_request", { ...BASE });
