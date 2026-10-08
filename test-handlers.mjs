@@ -63,6 +63,21 @@ const reset = () => {
 const reply = (status, body) =>
   new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+/**
+ * Map a reviewer ref from a PUT body back to the full fake user, as Bitbucket would.
+ * @param {{ uuid?: string, account_id?: string }} r - A reviewer ref.
+ * @returns {object} the matching fake user, or a bare `{ account_id }` user for someone the fake doesn't know.
+ */
+const byRef = (r) => [ALICE, BOB].find((u) => u.uuid === r.uuid || u.account_id === r.account_id) ?? { account_id: r.account_id };
+
+/**
+ * Fake Bitbucket: logs every request, then answers the PR, comment, and resolve
+ * endpoints from the in-memory state that reset() builds. Anything else is a 500
+ * so an unexpected request fails loudly.
+ * @param {string|URL} url - Request URL.
+ * @param {RequestInit} [init] - Request options (method, JSON body).
+ * @returns {Promise<Response>} the fake response.
+ */
 globalThis.fetch = async (url, init = {}) => {
   const { pathname } = new URL(url);
   const method = init.method || "GET";
@@ -77,7 +92,6 @@ globalThis.fetch = async (url, init = {}) => {
     if (method === "PUT") {
       if (body.destination?.branch?.name === "missing") return reply(400, { error: { message: "destination: branch not found" } });
       if (body.title === "bad-reviewer") return reply(400, { error: { message: "reviewers: Malformed reviewers list" } });
-      const byRef = (r) => [ALICE, BOB].find((u) => u.uuid === r.uuid || u.account_id === r.account_id) ?? { account_id: r.account_id };
       Object.assign(pr, body, { reviewers: body.reviewers.map(byRef) });
       if (body.description !== undefined) pr.summary = { raw: body.description };
       if (pr.id === 44) pr.close_source_branch = false;
@@ -85,6 +99,8 @@ globalThis.fetch = async (url, init = {}) => {
     }
   }
   if (p === "/42/comments" && method === "GET") return reply(200, { values: [1, 2, 3, 4].map((id) => comments[id]) });
+  // PR 45: a listing that repeats comment 2, as a page boundary shifting under new comments could.
+  if (p === "/45/comments" && method === "GET") return reply(200, { values: [1, 2, 2, 4].map((id) => comments[id]) });
   if ((m = p.match(/^\/42\/comments\/(\d+)$/))) {
     const c = comments[m[1]];
     if (method === "GET") return reply(200, c);
@@ -205,6 +221,15 @@ r = await call("get_pull_request_comments", { ...BASE, threaded: true });
 check("nests replies and keeps roots in order", r.json?.threads?.map((t) => [t.id, t.replies?.map((x) => x.id)]), [[1, [2]], [3, undefined]]);
 check("nests a reply to a reply", r.json?.threads?.[0]?.replies?.[0]?.replies?.map((x) => x.id), [4]);
 check("marks the resolved thread", r.json?.threads?.[1]?.resolved, true);
+r = await call("get_pull_request_comments", { ...BASE, pull_request_id: 45, threaded: true });
+check("a listing that repeats a comment id doesn't crash, and keeps it once", [r.isError, r.json?.threads?.[0]?.replies?.map((x) => x.id)], [false, [2]]);
+
+process.stdout.write("get_pull_request:\n");
+r = await call("get_pull_request", { ...BASE });
+check("reviewers carry display_name, account_id, and uuid", r.json?.reviewers, [
+  { display_name: "Alice", account_id: ALICE.account_id, uuid: ALICE.uuid },
+  { display_name: "Bob", account_id: BOB.account_id, uuid: BOB.uuid },
+]);
 
 await client.close();
 if (failures) {

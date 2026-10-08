@@ -24,12 +24,22 @@ This is the "build it yourself" option, so the capability boundary lives in code
 
   Inline, multi-line, @-mention, and reply comments all use that single comments `POST` — they add request-body fields, not new endpoints — so the write boundary stays exactly these ten.
 
-- **PUT bodies are field-allowlisted too.** Bitbucket's update-PR endpoint accepts the whole pull-request document, so the path alone isn't a tight enough boundary. `bbWrite()` refuses an update whose body carries any other field — `state`, `source`, `close_source_branch`, `merge_commit`, … — and refuses a `destination` that names anything but a branch (a different repository or commit). A comment edit may carry only the new text, so it can't re-anchor or re-parent a comment.
-- **What it deliberately cannot do.** There is **no** path that can **merge, decline, delete a PR or a comment, change a PR's source branch / state / close-source-branch setting, delete or create branches, delete a repository, or change settings** — those endpoints and fields are not in the allowlist, so `bbWrite()` rejects them even if a future code change or a malicious prompt tries to construct the request. The allowlist patterns are anchored, the PR and comment id segments are constrained to digits, and the workspace/repo segments cannot contain a slash or be a `.` / `..` dot segment (enforced at three layers: the `slug` input schema rejects them, every call site percent-encodes the segment, and the anchored allowlist regex is the backstop). On top of that, `bbWrite()` refuses any path the URL parser would rewrite — collapsed `.`/`..` segments, their `%2e` forms, backslashes — so the path that was checked is exactly the path that is sent, and it can't be redirected to a different sub-resource like `/merge` or to another endpoint entirely. The body that is checked is likewise exactly the JSON that is sent: `bbWrite()` serializes first and validates the parsed result.
+- **PUT bodies are field- and type-allowlisted too.** Bitbucket's update-PR endpoint accepts the whole pull-request document, so the path alone isn't a tight enough boundary. `bbWrite()` refuses an update whose body carries any other field — `state`, `source`, `close_source_branch`, `merge_commit`, … — or an allowed field of the wrong type:
+  - `title` and `description` must be strings and `draft` a boolean.
+  - `reviewers` must be a list of `{ uuid }` or `{ account_id }` references.
+  - `destination` must be exactly `{ branch: { name } }`, never a different repository or commit.
+
+  A comment edit may carry only `{ content: { raw: <string> } }`, so it can't re-anchor or re-parent a comment.
+- **What it deliberately cannot do.** There is **no** path that can **merge, decline, delete a PR or a comment, change a PR's source branch / state / close-source-branch setting, delete or create branches, delete a repository, or change settings**. Those endpoints and fields are not in the allowlist, so `bbWrite()` rejects them even if a future code change or a malicious prompt tries to construct the request. The allowlist patterns are anchored and the PR and comment id segments are constrained to digits. The workspace/repo segments can't escape their place in the path:
+  - **A slash** is blocked at three layers. The `slug` input schema rejects it, every call site percent-encodes the segment, and the anchored allowlist regex (`[^/]+`) is the backstop.
+  - **A `.` / `..` dot segment** is blocked at two layers. The `slug` input schema rejects it, and `bbWrite()` refuses any path the URL parser would rewrite (collapsed `.`/`..` segments, their `%2e` forms, backslashes) or that hides an encoded `/`, `\`, or `.`. Percent-encoding and the regex do *not* stop dot segments: `encodeURIComponent("..")` is `..`, and `[^/]+` matches it.
+  - **`slug` only accepts what Bitbucket issues:** letters, digits, `.`, `_`, `-`, or a brace-wrapped UUID. So no `%`, backslash, space, or query character reaches a path.
+
+  So the path that was checked is exactly the path that is sent, and it can't be redirected to a different sub-resource like `/merge` or to another endpoint entirely. The body that was checked is likewise exactly the JSON that is sent, because `bbWrite()` serializes first and validates the parsed result. It also requires the path to be a primitive string, so it can't stringify differently when the URL is built.
 - **No emoji reactions.** Bitbucket Cloud's public REST API has no endpoint for reacting to comments (only Bitbucket Data Center has one), so this server can't add reactions. It deliberately doesn't use the undocumented endpoint the Bitbucket web UI calls: that's unsupported, can change without notice, and would sit outside the allowlist design.
 - **The boundary is tested.** `npm test` runs three suites, none of which touch the network:
-  - `test.mjs` asserts the allowlist permits the ten writes above and refuses merge, decline, delete, wrong-method, traversal, and dot-segment attempts, plus every out-of-bounds `PUT` body.
-  - `test-tools.mjs` confirms every tool registers with a valid schema, and that only the write tools drop the `readOnlyHint` annotation.
+  - `test.mjs` asserts the allowlist permits the ten writes above. It refuses merge, decline, delete, wrong-method, traversal, dot-segment, and encoded-separator attempts, plus `PUT` bodies with an extra field or a field of the wrong type. It also checks that what's validated is exactly what's sent (`prepareWrite`).
+  - `test-tools.mjs` confirms every tool registers with a valid schema, that only the write tools drop the `readOnlyHint` annotation, and that every tool's `workspace`/`repo` input enforces the slug rule.
   - `test-handlers.mjs` calls the PR-update and comment-thread tools through an MCP client against a fake Bitbucket. It asserts the exact requests each one sends, and that refused and no-op calls send no write at all.
 - **Pinned dependencies.** Only `@modelcontextprotocol/sdk` and `zod`, both pinned to exact versions. Install once and run your reviewed copy.
 - **Credentials stay local.** Read from the environment, used only for the `Authorization` header, never logged or sent elsewhere.
@@ -46,7 +56,7 @@ The token's `pullrequest` write scope (required by Bitbucket to review, create, 
 
 Pick the set for what you want the server to do. **Select every scope in the set — Bitbucket's scoped API tokens do _not_ imply one scope from another** (e.g. `read:pullrequest:bitbucket` does *not* grant repository read), so a partial set causes confusing 403s.
 
-**Read-only** — every read tool works; `review_pull_request`, `create_pull_request`, and `update_pull_request` return 403:
+**Read + comment** — every read tool works, and so do posting, editing, and resolving comments (Atlassian's `read:pullrequest` scope includes commenting); `review_pull_request`, `create_pull_request`, and `update_pull_request` return 403. Note that this is *not* a read-only token: it can comment as you.
 
 ```
 read:repository:bitbucket
@@ -54,7 +64,7 @@ read:pullrequest:bitbucket
 read:workspace:bitbucket
 ```
 
-**Read + write** — the read-only set **plus** the write scope, enabling comment / review / create:
+**Read + write** — the read + comment set **plus** the write scope, enabling every tool: comment, review, create, and update:
 
 ```
 read:repository:bitbucket
@@ -75,7 +85,7 @@ What each scope covers in this server:
 Notes:
 
 - **Use the granular `:bitbucket` scope names**, not the bare OAuth names (`pullrequest`, `repository`, …). Atlassian's docs show both vocabularies; scoped API tokens use the `:bitbucket` form.
-- Per Atlassian's scope descriptions, **posting, editing, and resolving comments** (`create_pull_request_comment`, including inline / multi-line / @-mention / reply; `update_pull_request_comment`; `resolve_pull_request_comment`) is covered by `read:pullrequest:bitbucket` ("plus the ability to comment"). Approving, requesting changes, creating PRs, and updating PRs require `write:pullrequest:bitbucket`. The read+write set above enables all of them; if a comment action ever 403s on a read-only token, add `write:pullrequest:bitbucket`.
+- Per Atlassian's scope descriptions, **posting, editing, and resolving comments** (`create_pull_request_comment`, including inline / multi-line / @-mention / reply; `update_pull_request_comment`; `resolve_pull_request_comment`) is covered by `read:pullrequest:bitbucket` ("plus the ability to comment"). Approving, requesting changes, creating PRs, and updating PRs require `write:pullrequest:bitbucket`. The read+write set above enables all of them; if a comment action ever 403s on a read + comment token, add `write:pullrequest:bitbucket`.
 
 ## Install (once)
 
@@ -128,7 +138,7 @@ Fully quit and relaunch Claude Desktop (config changes load only on a full resta
 | Tool | Access | What it does |
 | --- | --- | --- |
 | `list_pull_requests` | read | List PRs for a repo (defaults to OPEN) |
-| `get_pull_request` | read | Details for one PR — description, reviewers (with account_ids), per-reviewer approval state |
+| `get_pull_request` | read | Details for one PR — description, reviewers (`display_name`, `account_id`, `uuid`), per-reviewer approval state |
 | `get_pull_request_comments` | read | Comments on a PR (general + inline), flat or grouped into threads (`threaded: true`) |
 | `get_pull_request_diff` | read | Comprehensive diff: per-file summary + raw unified diff (scopable, truncating) |
 | `get_pull_request_template` | read | Find and return a repo's PR template, if any |
@@ -179,7 +189,7 @@ One tool, several modes (it always uses the single comments `POST`):
 Returns each member's `account_id`, `uuid`, `nickname`, `display_name`, and a ready-to-paste `mention` (`@{account_id}`). Filter by name with `query` (matched case-insensitively against display name / nickname). Two uses:
 
 - **To tag someone in a comment**, copy their `mention` value straight into `create_pull_request_comment`'s `content`.
-- **To add a reviewer** on `create_pull_request`, pass their `account_id` in `reviewers`.
+- **To add a reviewer**, pass their `account_id` in `create_pull_request`'s `reviewers`, or in `update_pull_request`'s `add_reviewers` for an existing PR.
 
 Requires the token's `read:workspace:bitbucket` scope.
 
@@ -204,6 +214,8 @@ Pass only what you want to change; everything else stays as it is. Bitbucket onl
 - `destination_branch` — retarget the PR to merge into a different branch.
 
 The tool reads the PR first, then always sends its current title, description, and reviewer list (with your additions/removals applied) along with your changes. Bitbucket doesn't document whether a partial update keeps fields it leaves out, so this makes sure editing the title, say, can never drop the reviewers or wipe the description. As a tripwire, it also compares the PR before and after. If any field you didn't ask to change comes back different (title, description, reviewers, draft, destination, or close-source-branch), the response lists it under `unexpected_changes` with its previous value and how to restore it. That's another `update_pull_request` call, except for close-source-branch, which only the Bitbucket UI can change. It can't merge, decline, change the source branch, or change `close_source_branch`, and `bbWrite()` would refuse a body that tried. If Bitbucket rejects the reviewer list (`Malformed reviewers list`), the error explains the usual causes: the author added as a reviewer, a user without repo access, or a current reviewer who has since been deactivated (remove them with `remove_reviewers`).
+
+One limit: Bitbucket has no way to make an update conditional on the PR not having changed, so the read and the write are separate requests. If someone else edits the description, or adds or removes a reviewer, in the moment between them, this update overwrites their change. The tripwire can't catch this, because its "before" is the PR as it was read. Re-read the PR with `get_pull_request` afterwards if others are actively editing it.
 
 ## Verify
 

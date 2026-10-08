@@ -28,6 +28,7 @@ const {
   buildPullRequestUpdate,
   buildCommentThreads,
   findUnexpectedChanges,
+  prepareWrite,
 } = await import("./server.js");
 
 let failures = 0;
@@ -124,6 +125,46 @@ check("backslash treated as a slash", isWriteAllowed("POST", "/repositories/a\\.
 check("query string smuggled into the path", isWriteAllowed("POST", `${WS}?x=1`), false);
 check("still allows a percent-encoded uuid slug", isWriteAllowed("POST", `/repositories/${encodeURIComponent("{504c3b62-8120-4f0c-a7bc-87800b9d6f70}")}/r/pullrequests/1/comments`), true);
 check("still allows a dotted (non-dot-segment) slug", isWriteAllowed("POST", "/repositories/acme/my.repo/pullrequests/1/approve"), true);
+check(
+  "encoded slash inside a segment (%2F..%2F..)",
+  isWriteAllowed("PUT", "/repositories/x%2F..%2F../snippets/pullrequests/42/comments/5", { content: { raw: "x" } }),
+  false
+);
+check("encoded slash, lower case (%2f)", isWriteAllowed("POST", "/repositories/a%2fb/repo/pullrequests"), false);
+check("encoded backslash (%5C)", isWriteAllowed("POST", "/repositories/a%5Cb/repo/pullrequests"), false);
+check("encoded dot inside a segment (%2e)", isWriteAllowed("POST", "/repositories/a%2eb/repo/pullrequests"), false);
+check("a non-string path (String object)", isWriteAllowed("POST", new String(WS)), false);
+
+process.stdout.write("write allowlist — REFUSED: PUT body fields of the wrong type:\n");
+const PR42 = `${WS}/42`;
+check("title as an object", isWriteAllowed("PUT", PR42, { title: { raw: "t" } }), false);
+check("description as a number", isWriteAllowed("PUT", PR42, { description: 5 }), false);
+check("draft as a string", isWriteAllowed("PUT", PR42, { draft: "yes" }), false);
+check("destination branch name as an object", isWriteAllowed("PUT", PR42, { destination: { branch: { name: {} } } }), false);
+check("destination branch name empty", isWriteAllowed("PUT", PR42, { destination: { branch: { name: "" } } }), false);
+check("reviewers not an array", isWriteAllowed("PUT", PR42, { reviewers: { uuid: "{x}" } }), false);
+check("reviewer with an extra key", isWriteAllowed("PUT", PR42, { reviewers: [{ uuid: "{x}", role: "PARTICIPANT" }] }), false);
+check("reviewer with both id forms", isWriteAllowed("PUT", PR42, { reviewers: [{ uuid: "{x}", account_id: "y" }] }), false);
+check("reviewer id as a number", isWriteAllowed("PUT", PR42, { reviewers: [{ account_id: 7 }] }), false);
+check("reviewer as a string", isWriteAllowed("PUT", PR42, { reviewers: ["557058:x"] }), false);
+check("comment raw as an object", isWriteAllowed("PUT", `${PR42}/comments/5`, { content: { raw: { html: "x" } } }), false);
+check("an empty reviewers list is fine", isWriteAllowed("PUT", PR42, { title: "t", reviewers: [] }), true);
+check("an empty description is fine", isWriteAllowed("PUT", PR42, { title: "t", description: "" }), true);
+
+process.stdout.write("prepareWrite (what is checked is exactly what is sent):\n");
+check(
+  "returns the URL and the exact JSON text",
+  prepareWrite("PUT", PR42, { title: "t" }),
+  { url: `https://api.bitbucket.org/2.0${PR42}`, json: '{"title":"t"}' }
+);
+check("a bodiless write sends no JSON", prepareWrite("POST", `${PR42}/approve`).json, undefined);
+const smuggler = Object.assign(Object.create({ toJSON: () => ({ state: "MERGED", close_source_branch: true }) }), { title: "t" });
+check("(the smuggling body's own keys alone would pass the body rule)", isWriteAllowed("PUT", PR42, smuggler), true);
+throws("refuses a body whose inherited toJSON serializes to a merge", () => prepareWrite("PUT", PR42, smuggler));
+let reads = 0;
+const shifty = { toString: () => (++reads === 1 ? PR42 : `${PR42}/merge`) }; // checked as one path, sent as another
+throws("refuses a non-string path (could stringify differently later)", () => prepareWrite("POST", shifty));
+throws("refuses a disallowed write outright", () => prepareWrite("POST", `${PR42}/merge`));
 
 process.stdout.write("slug input invariant (workspace/repo cannot contain '/' or be a dot segment):\n");
 check("accepts a plain slug", slug.safeParse("acme").success, true);
@@ -134,6 +175,13 @@ check("rejects a slash (path injection)", slug.safeParse("repo/42/merge").succes
 check("rejects an encoded-looking slash payload", slug.safeParse("a/b").success, false);
 check("rejects '.'", slug.safeParse(".").success, false);
 check("rejects '..'", slug.safeParse("..").success, false);
+check("accepts underscores, hyphens, digits, mixed case", slug.safeParse("My_Repo-2.0").success, true);
+check("rejects a space", slug.safeParse("my repo").success, false);
+check("rejects a backslash", slug.safeParse("a\\b").success, false);
+check("rejects a percent sign (pre-encoded payload)", slug.safeParse("a%2Fb").success, false);
+check("rejects a query character", slug.safeParse("repo?x=1").success, false);
+check("rejects braces that aren't a uuid", slug.safeParse("{not-a-uuid}").success, false);
+check("rejects an empty string", slug.safeParse("").success, false);
 
 process.stdout.write("toReviewer parsing:\n");
 check("account_id with colon", toReviewer("557058:f0c3abcd-1234-5678-9abc-def012345678"), { account_id: "557058:f0c3abcd-1234-5678-9abc-def012345678" });
@@ -343,6 +391,16 @@ check(
   [{ id: 9, parent_id: 7, content: "orphan", parent_not_fetched: true }]
 );
 check("no comments → no threads", buildCommentThreads([]), []);
+check(
+  "a repeated comment id is kept once, at its first position (no crash)",
+  buildCommentThreads([
+    { id: 1, content: "root" },
+    { id: 2, parent_id: 1, content: "reply" },
+    { id: 2, parent_id: 1, content: "reply" },
+    { id: 1, content: "root" },
+  ]),
+  [{ id: 1, content: "root", replies: [{ id: 2, parent_id: 1, content: "reply" }] }]
+);
 const input = [{ id: 1 }, { id: 2, parent_id: 1 }];
 buildCommentThreads(input);
 check("does not mutate its input", input, [{ id: 1 }, { id: 2, parent_id: 1 }]);

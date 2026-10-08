@@ -10,8 +10,9 @@
  *     allowlist is authoritative, not undici's redirect behavior. Never logs creds.
  *   - Writes go through bbWrite(), which (a) only accepts POST, PUT, or DELETE,
  *     (b) validates the request path — and, for the two PUTs, the request body's
- *     fields — against WRITE_ALLOWLIST, a small, explicit set of pull-request
- *     endpoints, before a request is made, and (c) like bbGet uses
+ *     fields and their types — against WRITE_ALLOWLIST, a small, explicit set of
+ *     pull-request endpoints, before a request is made (checking the exact path
+ *     string and the exact JSON that will be sent), and (c) like bbGet uses
  *     redirect:"manual" and REFUSES to follow any 3xx, so a write can never be
  *     transparently redirected to a different endpoint with creds attached.
  *     The permitted writes are:
@@ -35,12 +36,17 @@
  *     delete branches, or change repository/workspace settings. Those endpoints
  *     (and body fields) are not in the allowlist, so bbWrite refuses them even if a
  *     future code change or a malicious prompt tries to build the request. The ids
- *     in each allowlisted path are constrained to digits; the workspace/repo
- *     segments cannot contain a slash or be a "." / ".." dot segment (enforced at
- *     three layers: the `slug` input schema, enc() at every call site, and the
- *     anchored allowlist regex), and bbWrite refuses any path the URL parser would
- *     rewrite (collapsed dot segments, %2e, backslashes), so the path cannot be
- *     redirected to a sub-resource like /merge or /decline, or to another endpoint.
+ *     in each allowlisted path are constrained to digits. The workspace/repo
+ *     segments can't escape their place in the path:
+ *       - a slash is blocked at three layers: the `slug` input schema, enc() at
+ *         every call site, and the anchored allowlist regex (`[^/]+`);
+ *       - a "." / ".." dot segment is blocked at two: the `slug` input schema, and
+ *         isCanonicalPath() in bbWrite, which refuses any path the URL parser would
+ *         rewrite (collapsed dot segments, their %2e forms, backslashes) or that
+ *         hides an encoded "/", "\", or "." (enc() and the regex do NOT stop dot
+ *         segments: enc("..") is "..", and `[^/]+` matches it).
+ *     So the path cannot be redirected to a sub-resource like /merge or /decline,
+ *     or to another endpoint.
  *   - Inline/multi-line/mention/reply comments all ride on the SAME comments POST,
  *     so they do not widen the write boundary — it stays exactly the ten endpoints
  *     above.
@@ -63,9 +69,10 @@
  *                                     and posting, editing, and resolving comments
  *         read:workspace:bitbucket    list_workspace_members (and list repos)
  *         write:pullrequest:bitbucket review actions (approve/request-changes),
- *                                     create PR, and update PR — omit for a
- *                                     read-only token
- *       Read-only set = the three read:* scopes. Read+write = add write:pullrequest.
+ *                                     create PR, and update PR — omit to keep the
+ *                                     token from changing PRs themselves
+ *       Read + comment set = the three read:* scopes (reads, plus posting, editing,
+ *       and resolving comments). Read + write = add write:pullrequest.
  *
  * Required environment variables:
  *   ATLASSIAN_USER_EMAIL   your Atlassian account email
@@ -269,16 +276,24 @@ const PR_UPDATE_FIELDS = Object.values(PR_FIELD);
 // Watched by the tripwire, but deliberately NOT sendable — this server can't change it.
 const CLOSE_SOURCE_BRANCH = "close_source_branch";
 
+// A percent-encoded "/", "\", or "." inside a path segment. No legitimate write
+// path contains one (slugs are limited to [A-Za-z0-9._-] or a brace-wrapped UUID,
+// ids to digits), and a server that decoded it could route to a path other than
+// the one that was checked.
+const ENCODED_SEPARATOR = /%(2f|5c|2e)/i;
+
 /**
  * Whether `path` reaches Bitbucket exactly as written. The URL parser collapses
  * "." and ".." segments (including their %2e forms) and turns "\" into "/", so a
  * string like `/repositories/../snippets/pullrequests/1/comments/2` can match an
  * allowlist pattern yet hit a different endpoint. Any path the parser would
- * rewrite is refused.
- * @param {string} path - Request path relative to /2.0, already percent-encoded.
- * @returns {boolean} true only when the parsed URL keeps the API origin and exactly this path, with no query or fragment.
+ * rewrite — or that hides an encoded separator a server might decode — is refused.
+ * @param {unknown} path - Request path relative to /2.0, already percent-encoded.
+ * @returns {boolean} true only for a string whose parsed URL keeps the API origin and exactly this path,
+ *   with no query, fragment, or encoded "/", "\", or ".".
  */
 const isCanonicalPath = (path) => {
+  if (typeof path !== "string" || ENCODED_SEPARATOR.test(path)) return false;
   try {
     const url = new URL(BASE + path);
     return url.origin === API_ORIGIN && url.pathname === API_PATH_PREFIX + path && !url.search && !url.hash;
@@ -301,25 +316,82 @@ const hasOnlyKeys = (obj, allowed) =>
   Object.keys(obj).every((k) => allowed.includes(k));
 
 /**
- * Body rule for `PUT .../pullrequests/{id}`: only PR_UPDATE_FIELDS, and a
- * `destination` may name nothing but a branch (`{ branch: { name } }`) — never a
- * different repository or commit.
- * @param {unknown} body - The JSON body bbWrite is about to send.
- * @returns {boolean} true when the body stays inside the update boundary; false for
- *   a missing/empty body or any other field.
+ * Whether `v` is a string.
+ * @param {unknown} v - Any value.
+ * @returns {boolean} true for a primitive string (including "").
  */
-const isAllowedPullRequestUpdate = (body) =>
-  hasOnlyKeys(body, PR_UPDATE_FIELDS) &&
-  (body[PR_FIELD.DESTINATION] === undefined ||
-    (hasOnlyKeys(body[PR_FIELD.DESTINATION], ["branch"]) && hasOnlyKeys(body[PR_FIELD.DESTINATION].branch, ["name"])));
+const isString = (v) => typeof v === "string";
+
+// --- Bitbucket's nested request shapes: each builder sits next to the check that
+// accepts exactly what it builds, so the two can't drift apart. ---
 
 /**
- * Body rule for `PUT .../comments/{cid}`: only the comment's text
- * (`{ content: { raw } }`), so an edit can't re-anchor or re-parent a comment.
- * @param {unknown} body - The JSON body bbWrite is about to send.
- * @returns {boolean} true only for exactly `{ content: { raw } }`.
+ * Build a branch reference, as used for a PR's source and destination.
+ * @param {string} name - Branch name (may contain slashes).
+ * @returns {{ branch: { name: string } }} the reference.
  */
-const isAllowedCommentUpdate = (body) => hasOnlyKeys(body, ["content"]) && hasOnlyKeys(body.content, ["raw"]);
+const branchRef = (name) => ({ branch: { name } });
+
+/**
+ * Whether `v` is exactly a branch reference as branchRef builds it — never one
+ * naming a repository or commit.
+ * @param {unknown} v - A candidate `destination` value.
+ * @returns {boolean} true only for `{ branch: { name: <non-empty string> } }`.
+ */
+const isBranchRef = (v) => hasOnlyKeys(v, ["branch"]) && hasOnlyKeys(v.branch, ["name"]) && isString(v.branch.name) && v.branch.name.length > 0;
+
+/**
+ * Build a comment's text payload.
+ * @param {string} raw - Comment text (Bitbucket Markdown).
+ * @returns {{ content: { raw: string } }} the payload.
+ */
+const commentText = (raw) => ({ content: { raw } });
+
+/**
+ * Whether `v` is exactly a comment-text payload as commentText builds it.
+ * @param {unknown} v - A candidate request body.
+ * @returns {boolean} true only for `{ content: { raw: <string> } }`.
+ */
+const isCommentText = (v) => hasOnlyKeys(v, ["content"]) && hasOnlyKeys(v.content, ["raw"]) && isString(v.content.raw);
+
+// The two ways a reviewer can be named, as toReviewer builds them.
+const REVIEWER_REF_KEYS = ["uuid", "account_id"];
+
+/**
+ * Whether `v` is a reviewer reference as toReviewer builds it.
+ * @param {unknown} v - One entry of a `reviewers` array.
+ * @returns {boolean} true only for `{ uuid: <string> }` or `{ account_id: <string> }`.
+ */
+const isReviewerRef = (v) => hasOnlyKeys(v, REVIEWER_REF_KEYS) && Object.keys(v).length === 1 && Object.values(v).every(isString);
+
+// The type each sendable PR field must have. Keyed by PR_FIELD, so a field can't
+// be added to the update without also saying what it may contain.
+const PR_FIELD_RULES = Object.freeze({
+  [PR_FIELD.TITLE]: isString,
+  [PR_FIELD.DESCRIPTION]: isString,
+  [PR_FIELD.REVIEWERS]: (v) => Array.isArray(v) && v.every(isReviewerRef),
+  [PR_FIELD.DRAFT]: (v) => typeof v === "boolean",
+  [PR_FIELD.DESTINATION]: isBranchRef,
+});
+
+/**
+ * Body rule for `PUT .../pullrequests/{id}`: only PR_UPDATE_FIELDS, each of the
+ * type PR_FIELD_RULES gives it — so a `destination` may name nothing but a branch
+ * (never a different repository or commit), and `reviewers` only uuid/account_id refs.
+ * @param {unknown} body - The parsed JSON body bbWrite is about to send.
+ * @returns {boolean} true when the body stays inside the update boundary; false for
+ *   a missing/empty body, any other field, or a field of the wrong type.
+ */
+const isAllowedPullRequestUpdate = (body) =>
+  hasOnlyKeys(body, PR_UPDATE_FIELDS) && Object.entries(body).every(([field, value]) => PR_FIELD_RULES[field](value));
+
+/**
+ * Body rule for `PUT .../comments/{cid}`: only the comment's text, so an edit
+ * can't re-anchor or re-parent a comment.
+ * @param {unknown} body - The parsed JSON body bbWrite is about to send.
+ * @returns {boolean} true only for exactly `{ content: { raw: <string> } }`.
+ */
+const isAllowedCommentUpdate = isCommentText;
 
 /**
  * The set of write endpoints this server may touch. Each entry is a (method,
@@ -346,9 +418,9 @@ const WRITE_ALLOWLIST = [
 /**
  * Pure predicate behind the write boundary: the method and path — and, for
  * entries with a body rule, the request body — must all match one allowlist
- * entry, and the path must survive URL parsing unchanged (isCanonicalPath).
- * Exported so the boundary can be exercised by tests without making any network
- * call.
+ * entry, and the path must be a string that survives URL parsing unchanged
+ * (isCanonicalPath). Exported so the boundary can be exercised by tests without
+ * making any network call.
  * @param {string} method - HTTP method; only POST, PUT, and DELETE can ever pass.
  * @param {string} path - Request path relative to /2.0, already percent-encoded.
  * @param {unknown} [body] - The parsed JSON body to send; checked only by entries with a body rule.
@@ -360,12 +432,34 @@ export function isWriteAllowed(method, path, body) {
 }
 
 /**
+ * Validate a write and produce exactly what will be sent. The body is serialized
+ * FIRST and the parsed result is what gets checked, so a toJSON() or getter can't
+ * make the checked object differ from the bytes on the wire; and `path` must be a
+ * primitive string, so it can't stringify differently when the URL is built.
+ * Exported for tests (pure — no network).
+ * @param {string} method - HTTP method.
+ * @param {string} path - Request path relative to /2.0.
+ * @param {unknown} [body] - The request body; omitted for bodiless writes.
+ * @returns {{ url: string, json: string|undefined }} the full URL and the exact JSON text to send.
+ * @throws {Error} when the request is outside the write allowlist.
+ */
+export const prepareWrite = (method, path, body) => {
+  const json = body === undefined ? undefined : JSON.stringify(body);
+  if (!isWriteAllowed(method, path, json === undefined ? undefined : JSON.parse(json))) {
+    throw new Error(
+      `bbWrite refuses ${method} ${path}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
+    );
+  }
+  return { url: BASE + path, json };
+};
+
+/**
  * The ONLY write primitive. It refuses any method other than POST/PUT/DELETE and
- * any request not in WRITE_ALLOWLIST (path, and body fields for the PUTs). Callers
- * build the request from validated arguments; the allowlist is defense-in-depth so
- * the boundary holds even if a call site is wrong. Like bbGet it uses
- * redirect:"manual" and refuses to follow a 3xx, so a write can never be
- * transparently redirected with creds attached. Writes are never retried.
+ * any request not in WRITE_ALLOWLIST (path, and body fields for the PUTs) — see
+ * prepareWrite. Callers build the request from validated arguments; the allowlist
+ * is defense-in-depth so the boundary holds even if a call site is wrong. Like
+ * bbGet it uses redirect:"manual" and refuses to follow a 3xx, so a write can
+ * never be transparently redirected with creds attached. Writes are never retried.
  * @param {"POST"|"PUT"|"DELETE"} method - HTTP method.
  * @param {string} path - Request path relative to /2.0, built from enc()-encoded segments.
  * @param {{ body?: object }} [options] - `body` is sent as JSON.
@@ -375,21 +469,13 @@ export function isWriteAllowed(method, path, body) {
  *   {BitbucketError} for any other non-2xx status.
  */
 async function bbWrite(method, path, { body } = {}) {
-  // Validate exactly what goes on the wire: serialize first and check the parsed
-  // JSON, so a toJSON() or getter can't make the checked object differ from the
-  // bytes sent.
-  const json = body === undefined ? undefined : JSON.stringify(body);
-  if (!isWriteAllowed(method, path, json === undefined ? undefined : JSON.parse(json))) {
-    throw new Error(
-      `bbWrite refuses ${method} ${path}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
-    );
-  }
+  const { url, json } = prepareWrite(method, path, body);
   const init = { method, headers: { Authorization: AUTH, Accept: "application/json" }, redirect: "manual" };
   if (json !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = json;
   }
-  const res = await doFetch(BASE + path, init, { retry: false });
+  const res = await doFetch(url, init, { retry: false });
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers.get("location");
     throw new Error(`Refusing to follow a redirect on write ${method} ${path}${loc ? ` → ${loc}` : ""}. Writes must hit the endpoint directly.`);
@@ -660,7 +746,7 @@ export const buildPullRequestUpdate = (
     updated.push(PR_FIELD.DRAFT);
   }
   if (destination_branch !== undefined) {
-    body[PR_FIELD.DESTINATION] = { branch: { name: destination_branch } };
+    body[PR_FIELD.DESTINATION] = branchRef(destination_branch);
     updated.push(PR_FIELD.DESTINATION);
   }
   if (!updated.length) {
@@ -713,21 +799,25 @@ export const findUnexpectedChanges = (before, after, updated) =>
  * Group flat comment summaries (from commentSummary) into threads: each root gets
  * a nested `replies` array, in the order the comments were given. A reply whose
  * parent wasn't in the fetched set (e.g. cut off by `limit`) becomes a root marked
- * `parent_not_fetched: true` rather than being dropped. Empty `replies` arrays are
- * omitted to keep the output compact. Exported for tests (pure — no network).
+ * `parent_not_fetched: true` rather than being dropped. A comment id that appears
+ * more than once (e.g. a page boundary shifting while new comments arrive) is kept
+ * once, at its first position. Empty `replies` arrays are omitted to keep the
+ * output compact. Exported for tests (pure — no network).
  * @param {Array<{ id: number, parent_id?: number }>} comments - Comment summaries, oldest first.
  * @returns {Array<object>} the thread roots, each a comment summary with optional nested `replies`.
  */
 export const buildCommentThreads = (comments) => {
-  const nodes = new Map(comments.map((c) => [c.id, { ...c, replies: [] }]));
-  const roots = [];
+  const nodes = new Map();
   for (const c of comments) {
-    const node = nodes.get(c.id);
-    const parent = c.parent_id !== undefined ? nodes.get(c.parent_id) : undefined;
+    if (!nodes.has(c.id)) nodes.set(c.id, { ...c, replies: [] });
+  }
+  const roots = [];
+  for (const node of nodes.values()) {
+    const parent = node.parent_id !== undefined ? nodes.get(node.parent_id) : undefined;
     if (parent && parent !== node) {
       parent.replies.push(node);
     } else {
-      if (c.parent_id !== undefined) node.parent_not_fetched = true;
+      if (node.parent_id !== undefined) node.parent_not_fetched = true;
       roots.push(node);
     }
   }
@@ -774,6 +864,13 @@ const branchSummary = (b) => ({
   target_date: b.target?.date,
 });
 
+/**
+ * Compact a PR comment to the fields an agent reads, replies to, edits, or resolves by.
+ * @param {object} c - A comment as Bitbucket returns it.
+ * @returns {object} id, author, timestamps, `parent_id` (replies only), `deleted`,
+ *   `resolved`/`resolved_by` (resolved threads only), the inline anchor (if any), and the raw text.
+ *   Fields Bitbucket omits come back undefined and drop out of the JSON.
+ */
 const commentSummary = (c) => ({
   id: c.id,
   author: c.user?.display_name,
@@ -797,11 +894,12 @@ const participantSummary = (p) => ({
 
 /**
  * Compact a PR reviewer to what an agent needs to name them and to pass them to
- * update_pull_request's add/remove_reviewers.
+ * update_pull_request's add/remove_reviewers (either id works there; uuid covers
+ * a user Bitbucket returns without an account_id).
  * @param {object} [u] - A user object from a PR's `reviewers`.
- * @returns {{ display_name?: string, account_id?: string }} fields are undefined when Bitbucket omits them.
+ * @returns {{ display_name?: string, account_id?: string, uuid?: string }} fields are undefined when Bitbucket omits them.
  */
-const reviewerSummary = (u) => ({ display_name: u?.display_name, account_id: u?.account_id });
+const reviewerSummary = (u) => ({ display_name: u?.display_name, account_id: u?.account_id, uuid: u?.uuid });
 
 const userSummary = (u) => ({
   account_id: u?.account_id,
@@ -827,16 +925,18 @@ const wrap = (fn) => async (args) => {
   }
 };
 
-// Workspace and repo slugs never contain a slash (UUIDs are brace-wrapped, also
-// slashless) and are never "." or ".." (enc() leaves dots alone, and the URL
-// parser would collapse such a segment — e.g. workspace ".." turns a comment PUT
-// into a snippet endpoint). Enforcing both at the input boundary makes the
-// invariant the write allowlist relies on explicit, instead of leaving it to
-// enc() + the allowlist alone. Do NOT apply this to ref/branch/path, which may
-// contain slashes and rely on enc() to encode them.
-export const slug = z.string().regex(/^(?!\.\.?$)[^/]+$/, "must not contain '/' or be '.' or '..'");
+// Workspace and repo identifiers, limited to what Bitbucket actually issues:
+// slugs of letters, digits, '.', '_', '-' (never just "." or "..", which the URL
+// parser would collapse — e.g. workspace ".." turns a comment PUT into a snippet
+// endpoint), or a brace-wrapped UUID. So no slash, backslash, '%', or other
+// character that could change which endpoint a path reaches. This makes the
+// invariant the write allowlist relies on explicit at the input boundary, instead
+// of leaving it to enc() + the allowlist alone. Do NOT apply this to
+// ref/branch/path, which may contain slashes and rely on enc() to encode them.
+const SLUG_PATTERN = /^(?:\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}|(?!\.\.?$)[A-Za-z0-9._-]+)$/;
+export const slug = z.string().regex(SLUG_PATTERN, "must be a Bitbucket slug (letters, digits, '.', '_', '-'; not '.' or '..') or a {uuid}");
 
-export const server = new McpServer({ name: "Bitbucket", version: "2.2.0" });
+export const server = new McpServer({ name: "Bitbucket", version: "2.2.1" });
 
 // ============================ READ TOOLS ============================
 
@@ -1101,7 +1201,7 @@ server.registerTool(
   {
     title: "List workspace members",
     description:
-      "List members of a Bitbucket workspace so you can @-mention them in comments or add them as reviewers. Returns each member's account_id, uuid, nickname, display_name, and a ready-to-use 'mention' string ('@{account_id}'). Filter by name with 'query'. To tag someone, copy their 'mention' value into a comment's 'content'. To add a reviewer on create_pull_request, pass their 'account_id'. (Requires the token's workspace read scope.)",
+      "List members of a Bitbucket workspace so you can @-mention them in comments or add them as reviewers. Returns each member's account_id, uuid, nickname, display_name, and a ready-to-use 'mention' string ('@{account_id}'). Filter by name with 'query'. To tag someone, copy their 'mention' value into a comment's 'content'. To add a reviewer, pass their 'account_id' in create_pull_request's 'reviewers' or update_pull_request's 'add_reviewers'. (Requires the token's workspace read scope.)",
     inputSchema: {
       workspace: slug,
       query: z.string().optional().describe("Case-insensitive substring matched against display_name or nickname"),
@@ -1249,7 +1349,7 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   wrap(async ({ workspace, repo, pull_request_id, content, file_path, line, start_line, line_side, parent_id }) => {
-    const body = { content: { raw: content } };
+    const body = commentText(content);
     if (parent_id !== undefined) {
       // Reply: inherits the parent's location. Inline anchoring is ignored.
       body.parent = { id: parent_id };
@@ -1288,10 +1388,16 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   },
+  /**
+   * Replace a comment's text (PUT .../comments/{cid}).
+   * @param {{ workspace: string, repo: string, pull_request_id: number, comment_id: number, content: string }} args - Validated tool input.
+   * @returns {Promise<object>} the tool result: the updated comment's summary and URL, or an isError
+   *   result explaining a 403 (not your comment). Other failures propagate to wrap().
+   */
   wrap(async ({ workspace, repo, pull_request_id, comment_id, content }) => {
     const path = `/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}/comments/${comment_id}`;
     try {
-      const updated = await bbWrite("PUT", path, { body: { content: { raw: content } } });
+      const updated = await bbWrite("PUT", path, { body: commentText(content) });
       return ok({ ...commentSummary(updated), url: updated.links?.html?.href });
     } catch (e) {
       if (e?.status === 403) {
@@ -1318,6 +1424,14 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
+  /**
+   * Resolve or reopen a comment thread. Reads the comment first, so a reply is
+   * refused (naming its top-level comment) and a no-op sends no write.
+   * @param {{ workspace: string, repo: string, pull_request_id: number, comment_id: number, action: string }} args - Validated tool input;
+   *   `action` is a THREAD_ACTION value.
+   * @returns {Promise<object>} the tool result: `{ action, comment_id, result, ... }`, or an isError result
+   *   for a reply. A 409 on resolve / 404 on reopen (a concurrent change) is reported as already done.
+   */
   wrap(async ({ workspace, repo, pull_request_id, comment_id, action }) => {
     const commentsPath = `/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}/comments`;
     const resolvePath = `${commentsPath}/${comment_id}/resolve`;
@@ -1407,9 +1521,9 @@ server.registerTool(
   wrap(async ({ workspace, repo, title, source_branch, destination_branch, description, reviewers, close_source_branch, draft, use_template }) => {
     const body = {
       title,
-      source: { branch: { name: source_branch } },
+      source: branchRef(source_branch),
     };
-    if (destination_branch) body.destination = { branch: { name: destination_branch } };
+    if (destination_branch) body.destination = branchRef(destination_branch);
 
     let templateApplied = null;
     let templateSkipped = null;
@@ -1466,6 +1580,16 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   },
+  /**
+   * Edit an open PR: read it, build the PUT body (buildPullRequestUpdate), write,
+   * then compare before/after (findUnexpectedChanges).
+   * @param {{ workspace: string, repo: string, pull_request_id: number }} args - Validated tool input, plus the
+   *   optional changes buildPullRequestUpdate takes (title, description, add_reviewers, remove_reviewers,
+   *   draft, destination_branch).
+   * @returns {Promise<object>} the tool result: the updated PR summary, `updated`, and — if Bitbucket changed
+   *   anything not requested — `unexpected_changes` plus a warning. isError for a non-OPEN PR or a rejected
+   *   reviewer list; builder errors (nothing to update, unknown reviewer) propagate to wrap().
+   */
   wrap(async ({ workspace, repo, pull_request_id, ...changes }) => {
     const path = `/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}`;
     const current = await bbGet(path);
