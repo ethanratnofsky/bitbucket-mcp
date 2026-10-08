@@ -35,6 +35,13 @@ const {
 } = await import("./server.js");
 
 let failures = 0;
+/**
+ * Record one assertion, printing ok/FAIL.
+ * @param {string} name - What is being checked.
+ * @param {unknown} actual - Observed value.
+ * @param {unknown} expected - Expected value; compared as JSON, so key order and undefined fields matter.
+ * @returns {void}
+ */
 function check(name, actual, expected) {
   const a = JSON.stringify(actual);
   const e = JSON.stringify(expected);
@@ -45,6 +52,12 @@ function check(name, actual, expected) {
     process.stdout.write(`  FAIL ${name}\n       expected ${e}\n       got      ${a}\n`);
   }
 }
+/**
+ * Record an assertion that `fn` throws (any error), printing ok/FAIL.
+ * @param {string} name - What is being checked.
+ * @param {() => unknown} fn - The call expected to throw.
+ * @returns {void}
+ */
 function throws(name, fn) {
   try {
     fn();
@@ -177,14 +190,27 @@ check("refuses a backslash", isCanonicalPath("/repositories/a\\b/r/pullrequests"
 check("refuses a query string", isCanonicalPath(`${WS}?x=1`), false);
 check("refuses a fragment", isCanonicalPath(`${WS}#x`), false);
 check("refuses a non-string", isCanonicalPath(new String(WS)), false);
+check("refuses a raw space (the parser would encode it)", isCanonicalPath("/repositories/a b/r/pullrequests"), false);
+check("refuses a raw brace (the parser would encode it)", isCanonicalPath("/repositories/a{b/r/pullrequests"), false);
+check("refuses raw non-ASCII (the parser would encode it)", isCanonicalPath("/repositories/é/r/pullrequests"), false);
+// Documented limit: other percent-escapes pass this layer unchanged — slug and the
+// allowlist's segment pattern are what refuse them (see the allowlist tests above).
+check("does NOT refuse %252F (documented: not this layer's job)", isCanonicalPath("/repositories/a%252Fb/r/pullrequests"), true);
+check("does NOT refuse %3B (documented: not this layer's job)", isCanonicalPath("/repositories/a%3Bb/r/pullrequests"), true);
 
 process.stdout.write("findFieldWithoutRule (startup check that every sendable PR field has a type rule):\n");
+/**
+ * A stand-in type rule that accepts anything.
+ * @returns {boolean} always true.
+ */
 const RULE = () => true;
 check("every field has an own rule → none missing", findFieldWithoutRule(["title", "draft"], { title: RULE, draft: RULE }), undefined);
 check("a field with no rule is reported", findFieldWithoutRule(["title", "label"], { title: RULE }), "label");
 check("a rule that isn't a function doesn't count", findFieldWithoutRule(["title"], { title: true }), "title");
 check("an inherited name ('constructor') doesn't borrow Object's function", findFieldWithoutRule(["constructor"], {}), "constructor");
 check("an inherited name ('toString') doesn't either", findFieldWithoutRule(["toString"], Object.freeze({})), "toString");
+throws("null rules with fields to check throws (documented TypeError)", () => findFieldWithoutRule(["title"], null));
+check("null rules with no fields to check → none missing", findFieldWithoutRule([], null), undefined);
 
 process.stdout.write("prepareWrite (what is checked is exactly what is sent):\n");
 check(
@@ -235,6 +261,23 @@ check("opaque account_id", toReviewer("712020:abc"), { account_id: "712020:abc" 
 throws("rejects an email", () => toReviewer("jane@example.com"));
 throws("rejects a display name with a space", () => toReviewer("Jane Doe"));
 throws("rejects empty", () => toReviewer("   "));
+/**
+ * Run `fn` and return the message of the error it throws.
+ * @param {() => unknown} fn - A call expected to throw.
+ * @returns {string|undefined} the error message, or undefined if `fn` returned.
+ */
+const errorOf = (fn) => {
+  try {
+    fn();
+    return undefined;
+  } catch (e) {
+    return e.message;
+  }
+};
+check("an empty reviewer says it's empty", /can't be empty/.test(errorOf(() => toReviewer(""))), true);
+check("…not that it has a space or '@'", /space or '@'/.test(errorOf(() => toReviewer(""))), false);
+check("a whitespace-only reviewer also says it's empty", /can't be empty/.test(errorOf(() => toReviewer("   "))), true);
+check("an email still gets the space-or-'@' message", /space or '@'/.test(errorOf(() => toReviewer("jane@example.com"))), true);
 
 process.stdout.write("buildInline (single + multi-line, new/old side):\n");
 check("single line, new side (default)", buildInline({ file_path: "a.ts", line: 42 }), { path: "a.ts", to: 42 });

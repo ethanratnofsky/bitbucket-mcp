@@ -39,7 +39,8 @@
  *     in each allowlisted path are constrained to digits. The workspace/repo
  *     segments can't escape their place in the path:
  *       - a slash, a "%" escape (single- or double-encoded), or any character
- *         outside [A-Za-z0-9._-] is refused at TWO layers: the `slug` input
+ *         outside [A-Za-z0-9._-] (other than the braces of a {uuid}, which both
+ *         layers accept) is refused at TWO layers: the `slug` input
  *         schema, and the allowlist's own segment pattern (PATH_SEGMENT), which
  *         admits only those characters or an encoded {uuid} (%7B…%7D). A slash or
  *         backslash also hits a third: enc() turns it into %2F / %5C, which
@@ -303,8 +304,11 @@ const ENCODED_SEPARATOR = /%(2f|5c|2e)/i;
  * rewrite — or that hides an encoded separator a server might decode — is refused.
  * Exported so this layer can be tested on its own, independent of the
  * allowlist's segment pattern (which currently also refuses these escapes). It
- * catches dot segments, backslashes, and %2F / %5C / %2E only — NOT other escapes
- * like %252F or %3B, which only `slug` and PATH_SEGMENT refuse.
+ * catches dot segments, backslashes, %2F / %5C / %2E, a query or fragment, a
+ * non-string, and any raw character the URL parser would rewrite (a space, a
+ * brace, a quote, a tab, non-ASCII, …) — but NOT other percent-escapes like
+ * %252F or %3B, which pass through the parser unchanged; only `slug` and
+ * PATH_SEGMENT refuse those.
  * @param {unknown} path - Request path relative to /2.0, already percent-encoded.
  * @returns {boolean} true only for a string whose parsed URL keeps the API origin and exactly this path,
  *   with no query, fragment, or encoded "/", "\", or ".".
@@ -410,6 +414,7 @@ const PR_FIELD_RULES = Object.freeze({
  * @param {string[]} fields - Field names that must each have a rule.
  * @param {object} rules - Map of field name → predicate.
  * @returns {string|undefined} the first field without an own function rule, or undefined when all have one.
+ * @throws {TypeError} when `rules` is null or undefined (from Object.hasOwn) and `fields` is non-empty.
  */
 export const findFieldWithoutRule = (fields, rules) =>
   fields.find((f) => !(Object.hasOwn(rules, f) && typeof rules[f] === "function"));
@@ -736,13 +741,19 @@ const REVIEWER_UUID_PATTERN = new RegExp(`^\\{?(${UUID_SOURCE})\\}?$`);
  * create-PR error. Exported for tests.
  * @param {string} s - An account_id or UUID; surrounding whitespace is trimmed.
  * @returns {{ uuid: string } | { account_id: string }} the reviewer reference.
- * @throws {Error} when the value is empty, contains whitespace, or contains '@'.
+ * @throws {Error} when the value is empty (or only whitespace), or contains whitespace or '@' — each with
+ *   a message naming the actual problem.
  */
 export function toReviewer(s) {
   const v = String(s).trim();
   const m = v.match(REVIEWER_UUID_PATTERN);
   if (m) return { uuid: `{${m[1]}}` };
-  if (v === "" || /\s/.test(v) || v.includes("@")) {
+  if (v === "") {
+    throw new Error(
+      `A reviewer can't be empty. Reviewers must be an account_id (e.g. "557058:...") or a UUID. Use list_workspace_members to look up a user's account_id.`
+    );
+  }
+  if (/\s/.test(v) || v.includes("@")) {
     throw new Error(
       `"${s}" doesn't look like a Bitbucket account_id or UUID (it has a space or '@'). Reviewers must be an account_id (e.g. "557058:...") or a UUID — not a name or email. Use list_workspace_members to look up a user's account_id.`
     );
