@@ -39,7 +39,9 @@ let failures = 0;
  * Record one assertion, printing ok/FAIL.
  * @param {string} name - What is being checked.
  * @param {unknown} actual - Observed value.
- * @param {unknown} expected - Expected value; compared as JSON, so key order and undefined fields matter.
+ * @param {unknown} expected - Expected value, compared via JSON.stringify: key order matters, but keys whose
+ *   value is undefined are dropped (so `{ a: 1, b: undefined }` equals `{ a: 1 }`), and an undefined array
+ *   entry equals null.
  * @returns {void}
  */
 function check(name, actual, expected) {
@@ -53,7 +55,27 @@ function check(name, actual, expected) {
   }
 }
 /**
- * Record an assertion that `fn` throws (any error), printing ok/FAIL.
+ * Run `fn` and return what it throws.
+ * @param {() => unknown} fn - A call expected to throw.
+ * @returns {unknown} the thrown value, or undefined if `fn` returned normally.
+ */
+const caught = (fn) => {
+  try {
+    fn();
+    return undefined;
+  } catch (e) {
+    return e;
+  }
+};
+/**
+ * Run `fn` and return the message of the error it throws.
+ * @param {() => unknown} fn - A call expected to throw.
+ * @returns {string|undefined} the error message, or undefined if `fn` returned.
+ */
+const errorOf = (fn) => caught(fn)?.message;
+/**
+ * Record an assertion that `fn` throws (any error), printing ok/FAIL. Use `caught`
+ * with `check` instead when the error's type or message matters.
  * @param {string} name - What is being checked.
  * @param {() => unknown} fn - The call expected to throw.
  * @returns {void}
@@ -193,10 +215,23 @@ check("refuses a non-string", isCanonicalPath(new String(WS)), false);
 check("refuses a raw space (the parser would encode it)", isCanonicalPath("/repositories/a b/r/pullrequests"), false);
 check("refuses a raw brace (the parser would encode it)", isCanonicalPath("/repositories/a{b/r/pullrequests"), false);
 check("refuses raw non-ASCII (the parser would encode it)", isCanonicalPath("/repositories/é/r/pullrequests"), false);
-// Documented limit: other percent-escapes pass this layer unchanged — slug and the
-// allowlist's segment pattern are what refuse them (see the allowlist tests above).
+check("refuses a raw double quote (the parser would encode it)", isCanonicalPath('/repositories/a"b/r/pullrequests'), false);
+check("refuses a raw tab (the parser would strip it)", isCanonicalPath("/repositories/a\tb/r/pullrequests"), false);
+// Documented limit: whatever the parser leaves alone passes this layer — other
+// percent-escapes, and raw characters like ' ! * ( ) ~ ; @. slug and the
+// allowlist's segment pattern are what refuse them.
 check("does NOT refuse %252F (documented: not this layer's job)", isCanonicalPath("/repositories/a%252Fb/r/pullrequests"), true);
 check("does NOT refuse %3B (documented: not this layer's job)", isCanonicalPath("/repositories/a%3Bb/r/pullrequests"), true);
+for (const ch of ["'", "!", "*", "(", ")", "~", ";", "@"]) {
+  check(`does NOT refuse a raw ${ch} (documented: not this layer's job)`, isCanonicalPath(`/repositories/a${ch}b/r/pullrequests`), true);
+}
+// …and since enc() leaves ' ! * ( ) ~ unencoded, those are exactly what a real call
+// site can hand this layer — so prove the other two layers do refuse them.
+for (const ch of ["'", "!", "*", "(", ")", "~"]) {
+  check(`enc() leaves ${ch} as is`, encodeURIComponent(ch), ch);
+  check(`slug refuses ${ch}`, slug.safeParse(`a${ch}b`).success, false);
+  check(`the allowlist refuses ${ch} after enc()`, isWriteAllowed("POST", `/repositories/${encodeURIComponent(`a${ch}b`)}/r/pullrequests`), false);
+}
 
 process.stdout.write("findFieldWithoutRule (startup check that every sendable PR field has a type rule):\n");
 /**
@@ -209,7 +244,7 @@ check("a field with no rule is reported", findFieldWithoutRule(["title", "label"
 check("a rule that isn't a function doesn't count", findFieldWithoutRule(["title"], { title: true }), "title");
 check("an inherited name ('constructor') doesn't borrow Object's function", findFieldWithoutRule(["constructor"], {}), "constructor");
 check("an inherited name ('toString') doesn't either", findFieldWithoutRule(["toString"], Object.freeze({})), "toString");
-throws("null rules with fields to check throws (documented TypeError)", () => findFieldWithoutRule(["title"], null));
+check("null rules with fields to check throws the documented TypeError", caught(() => findFieldWithoutRule(["title"], null)) instanceof TypeError, true);
 check("null rules with no fields to check → none missing", findFieldWithoutRule([], null), undefined);
 
 process.stdout.write("prepareWrite (what is checked is exactly what is sent):\n");
@@ -261,23 +296,11 @@ check("opaque account_id", toReviewer("712020:abc"), { account_id: "712020:abc" 
 throws("rejects an email", () => toReviewer("jane@example.com"));
 throws("rejects a display name with a space", () => toReviewer("Jane Doe"));
 throws("rejects empty", () => toReviewer("   "));
-/**
- * Run `fn` and return the message of the error it throws.
- * @param {() => unknown} fn - A call expected to throw.
- * @returns {string|undefined} the error message, or undefined if `fn` returned.
- */
-const errorOf = (fn) => {
-  try {
-    fn();
-    return undefined;
-  } catch (e) {
-    return e.message;
-  }
-};
 check("an empty reviewer says it's empty", /can't be empty/.test(errorOf(() => toReviewer(""))), true);
-check("…not that it has a space or '@'", /space or '@'/.test(errorOf(() => toReviewer(""))), false);
+check("…not that it has whitespace or an '@'", /whitespace or an '@'/.test(errorOf(() => toReviewer(""))), false);
 check("a whitespace-only reviewer also says it's empty", /can't be empty/.test(errorOf(() => toReviewer("   "))), true);
-check("an email still gets the space-or-'@' message", /space or '@'/.test(errorOf(() => toReviewer("jane@example.com"))), true);
+check("an email gets the whitespace-or-'@' message", /whitespace or an '@'/.test(errorOf(() => toReviewer("jane@example.com"))), true);
+check("an embedded tab gets the whitespace-or-'@' message too", /whitespace or an '@'/.test(errorOf(() => toReviewer("a\tb"))), true);
 
 process.stdout.write("buildInline (single + multi-line, new/old side):\n");
 check("single line, new side (default)", buildInline({ file_path: "a.ts", line: 42 }), { path: "a.ts", to: 42 });

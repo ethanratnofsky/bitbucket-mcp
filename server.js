@@ -306,9 +306,11 @@ const ENCODED_SEPARATOR = /%(2f|5c|2e)/i;
  * allowlist's segment pattern (which currently also refuses these escapes). It
  * catches dot segments, backslashes, %2F / %5C / %2E, a query or fragment, a
  * non-string, and any raw character the URL parser would rewrite (a space, a
- * brace, a quote, a tab, non-ASCII, …) — but NOT other percent-escapes like
- * %252F or %3B, which pass through the parser unchanged; only `slug` and
- * PATH_SEGMENT refuse those.
+ * brace, a double quote, a tab, non-ASCII, …). It does NOT refuse anything the
+ * parser leaves alone: other percent-escapes like %252F or %3B, and raw
+ * characters such as ' ! * ( ) ~ ; @ — and enc() leaves ' ! * ( ) ~ unencoded,
+ * so those can reach this layer from a real call site. Only `slug` and
+ * PATH_SEGMENT refuse them.
  * @param {unknown} path - Request path relative to /2.0, already percent-encoded.
  * @returns {boolean} true only for a string whose parsed URL keeps the API origin and exactly this path,
  *   with no query, fragment, or encoded "/", "\", or ".".
@@ -755,7 +757,7 @@ export function toReviewer(s) {
   }
   if (/\s/.test(v) || v.includes("@")) {
     throw new Error(
-      `"${s}" doesn't look like a Bitbucket account_id or UUID (it has a space or '@'). Reviewers must be an account_id (e.g. "557058:...") or a UUID — not a name or email. Use list_workspace_members to look up a user's account_id.`
+      `"${s}" doesn't look like a Bitbucket account_id or UUID (it contains whitespace or an '@'). Reviewers must be an account_id (e.g. "557058:...") or a UUID — not a name or email. Use list_workspace_members to look up a user's account_id.`
     );
   }
   return { account_id: v };
