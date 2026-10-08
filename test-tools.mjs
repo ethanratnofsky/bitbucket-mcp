@@ -89,6 +89,12 @@ const unguardedSlug = tools
   .map(([name, k]) => `${name}.${k}`);
 
 let failures = 0;
+/**
+ * Record one pass/fail line.
+ * @param {boolean} cond - Whether the check passed.
+ * @param {string} msg - What was checked (and, on failure, what was wrong).
+ * @returns {void}
+ */
 const line = (cond, msg) => {
   if (cond) process.stdout.write(`  ok   ${msg}\n`);
   else {
