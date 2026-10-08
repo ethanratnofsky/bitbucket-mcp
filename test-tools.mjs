@@ -64,6 +64,30 @@ const wrongHint = tools
   .filter((t) => t.annotations?.readOnlyHint !== !WRITE_TOOLS.has(t.name))
   .map((t) => t.name);
 
+/**
+ * Whether a JSON-schema string property enforces the workspace/repo slug rule:
+ * it must carry a pattern that accepts a normal slug and a {uuid} but rejects
+ * a slash, a dot segment, and a pre-encoded payload.
+ * @param {object} [prop] - The property's JSON schema.
+ * @returns {boolean} true when the pattern behaves like `slug`.
+ */
+const enforcesSlug = (prop) => {
+  if (!prop?.pattern) return false;
+  const re = new RegExp(prop.pattern);
+  return (
+    re.test("acme") &&
+    re.test("{504c3b62-8120-4f0c-a7bc-87800b9d6f70}") &&
+    !re.test("a/b") &&
+    !re.test("..") &&
+    !re.test(".") &&
+    !re.test("a%2Fb")
+  );
+};
+const unguardedSlug = tools
+  .flatMap((t) => ["workspace", "repo"].filter((k) => t.inputSchema?.properties?.[k]).map((k) => [t.name, k]))
+  .filter(([name, k]) => !enforcesSlug(tools.find((t) => t.name === name).inputSchema.properties[k]))
+  .map(([name, k]) => `${name}.${k}`);
+
 let failures = 0;
 const line = (cond, msg) => {
   if (cond) process.stdout.write(`  ok   ${msg}\n`);
@@ -78,6 +102,7 @@ line(missing.length === 0, `all expected tools present${missing.length ? ` (miss
 line(extra.length === 0, `no unexpected tools${extra.length ? ` (extra: ${extra.join(", ")})` : ""}`);
 line(noSchema.length === 0, `every tool has an input schema${noSchema.length ? ` (missing: ${noSchema.join(", ")})` : ""}`);
 line(wrongHint.length === 0, `every tool's readOnlyHint matches whether it writes${wrongHint.length ? ` (wrong: ${wrongHint.join(", ")})` : ""}`);
+line(unguardedSlug.length === 0, `every workspace/repo input enforces the slug rule${unguardedSlug.length ? ` (missing: ${unguardedSlug.join(", ")})` : ""}`);
 
 if (failures) {
   process.stderr.write(`\n${failures} tool-registration check(s) FAILED.\n`);
