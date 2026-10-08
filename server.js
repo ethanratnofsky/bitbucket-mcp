@@ -38,13 +38,17 @@
  *     future code change or a malicious prompt tries to build the request. The ids
  *     in each allowlisted path are constrained to digits. The workspace/repo
  *     segments can't escape their place in the path:
- *       - a slash is blocked at three layers: the `slug` input schema, enc() at
- *         every call site, and the anchored allowlist regex (`[^/]+`);
+ *       - a slash, a "%" escape (single- or double-encoded), or any character
+ *         outside [A-Za-z0-9._-] is handled at three layers: the `slug` input
+ *         schema rejects it; enc() at every call site encodes it, so it can't act
+ *         as a separator; and the allowlist's own segment pattern (PATH_SEGMENT)
+ *         refuses the result, admitting only those characters or an encoded
+ *         {uuid} (%7B…%7D);
  *       - a "." / ".." dot segment is blocked at two: the `slug` input schema, and
  *         isCanonicalPath() in bbWrite, which refuses any path the URL parser would
  *         rewrite (collapsed dot segments, their %2e forms, backslashes) or that
- *         hides an encoded "/", "\", or "." (enc() and the regex do NOT stop dot
- *         segments: enc("..") is "..", and `[^/]+` matches it).
+ *         contains an encoded "/", "\", or "." (enc() and PATH_SEGMENT do NOT stop
+ *         dot segments: enc("..") is "..", and dots are legal slug characters).
  *     So the path cannot be redirected to a sub-resource like /merge or /decline,
  *     or to another endpoint.
  *   - Inline/multi-line/mention/reply comments all ride on the SAME comments POST,
@@ -117,6 +121,10 @@ const THREAD_ACTION = Object.freeze({ RESOLVE: "resolve", REOPEN: "reopen" });
 const TIMEOUT_MS = Number(process.env.BITBUCKET_TIMEOUT_MS) || 30_000;
 const MAX_RETRIES = 3; // GET only; writes are never auto-retried
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
+// Regex source for a bare UUID (no braces), shared by toReviewer, the `slug`
+// input schema, and the write allowlist's path segments.
+const UUID_SOURCE = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 
 const enc = encodeURIComponent;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -364,15 +372,32 @@ const REVIEWER_REF_KEYS = ["uuid", "account_id"];
  */
 const isReviewerRef = (v) => hasOnlyKeys(v, REVIEWER_REF_KEYS) && Object.keys(v).length === 1 && Object.values(v).every(isString);
 
-// The type each sendable PR field must have. Keyed by PR_FIELD, so a field can't
-// be added to the update without also saying what it may contain.
+/**
+ * Whether `v` is a list of reviewer references.
+ * @param {unknown} v - A candidate `reviewers` value.
+ * @returns {boolean} true for an array (possibly empty) whose every entry passes isReviewerRef.
+ */
+const isReviewerList = (v) => Array.isArray(v) && v.every(isReviewerRef);
+
+/**
+ * Whether `v` is a boolean.
+ * @param {unknown} v - Any value.
+ * @returns {boolean} true only for `true` or `false`.
+ */
+const isBoolean = (v) => typeof v === "boolean";
+
+// The type each sendable PR field must have, keyed by PR_FIELD.
 const PR_FIELD_RULES = Object.freeze({
   [PR_FIELD.TITLE]: isString,
   [PR_FIELD.DESCRIPTION]: isString,
-  [PR_FIELD.REVIEWERS]: (v) => Array.isArray(v) && v.every(isReviewerRef),
-  [PR_FIELD.DRAFT]: (v) => typeof v === "boolean",
+  [PR_FIELD.REVIEWERS]: isReviewerList,
+  [PR_FIELD.DRAFT]: isBoolean,
   [PR_FIELD.DESTINATION]: isBranchRef,
 });
+// Fail at startup — not on the first update — if a sendable field is ever added
+// to PR_FIELD without a type rule here.
+const fieldWithoutRule = PR_UPDATE_FIELDS.find((f) => typeof PR_FIELD_RULES[f] !== "function");
+if (fieldWithoutRule) throw new Error(`[bitbucket-mcp] PR_FIELD_RULES has no type rule for "${fieldWithoutRule}".`);
 
 /**
  * Body rule for `PUT .../pullrequests/{id}`: only PR_UPDATE_FIELDS, each of the
@@ -383,7 +408,7 @@ const PR_FIELD_RULES = Object.freeze({
  *   a missing/empty body, any other field, or a field of the wrong type.
  */
 const isAllowedPullRequestUpdate = (body) =>
-  hasOnlyKeys(body, PR_UPDATE_FIELDS) && Object.entries(body).every(([field, value]) => PR_FIELD_RULES[field](value));
+  hasOnlyKeys(body, PR_UPDATE_FIELDS) && Object.entries(body).every(([field, value]) => PR_FIELD_RULES[field](value) === true);
 
 /**
  * Body rule for `PUT .../comments/{cid}`: only the comment's text, so an edit
@@ -393,26 +418,42 @@ const isAllowedPullRequestUpdate = (body) =>
  */
 const isAllowedCommentUpdate = isCommentText;
 
+// One workspace or repo segment as it may appear in a write path: a slug made of
+// the characters `slug` allows, or a brace-wrapped UUID as enc() encodes it
+// (%7B…%7D). Nothing else — no other "%" escape (so no %2F, no double-encoded
+// %252F), no ";", "@", or non-ASCII — can match, so the allowlist enforces the
+// same character set as the input schema rather than trusting it.
+const PATH_SEGMENT = `(?:[A-Za-z0-9._-]+|%7[Bb]${UUID_SOURCE}%7[Dd])`;
+
+/**
+ * Build an anchored allowlist pattern for a path under one repository's
+ * pullrequests collection.
+ * @param {string} [suffix] - Regex source for what follows `/pullrequests`, e.g. String.raw`/\d+/approve`; "" for the collection itself.
+ * @returns {RegExp} `^/repositories/<segment>/<segment>/pullrequests<suffix>$`.
+ */
+const pullRequestRoute = (suffix = "") => new RegExp(`^/repositories/${PATH_SEGMENT}/${PATH_SEGMENT}/pullrequests${suffix}$`);
+
 /**
  * The set of write endpoints this server may touch. Each entry is a (method,
  * path-pattern) pair, plus — for the PUTs, whose body decides what changes — a
  * `body` rule. bbWrite rejects anything that doesn't match exactly, so
  * merge/decline/delete and arbitrary targets are unreachable. The patterns are
- * anchored; `[^/]+` for the workspace/repo segments cannot swallow a slash, and
- * the PR and comment ids are constrained to digits. A "." or ".." segment would
- * still match `[^/]+`, which is why isWriteAllowed also requires isCanonicalPath.
+ * anchored; a workspace/repo segment (PATH_SEGMENT) cannot contain a slash or any
+ * "%" escape other than an encoded UUID's braces, and the PR and comment ids are
+ * constrained to digits. A "." or ".." segment WOULD still match PATH_SEGMENT
+ * (dots are legal in slugs), which is why isWriteAllowed also requires isCanonicalPath.
  */
 const WRITE_ALLOWLIST = [
-  { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests$/, what: "create pull request" },
-  { method: "PUT", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+$/, body: isAllowedPullRequestUpdate, what: "update PR title/description/reviewers/draft/destination" },
-  { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments$/, what: "comment on PR" },
-  { method: "PUT", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments\/\d+$/, body: isAllowedCommentUpdate, what: "edit a PR comment's text" },
-  { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments\/\d+\/resolve$/, what: "resolve a comment thread" },
-  { method: "DELETE", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/comments\/\d+\/resolve$/, what: "reopen a comment thread" },
-  { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/approve$/, what: "approve PR" },
-  { method: "DELETE", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/approve$/, what: "un-approve PR" },
-  { method: "POST", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/request-changes$/, what: "request changes on PR" },
-  { method: "DELETE", re: /^\/repositories\/[^/]+\/[^/]+\/pullrequests\/\d+\/request-changes$/, what: "withdraw request-changes on PR" },
+  { method: "POST", re: pullRequestRoute(), what: "create pull request" },
+  { method: "PUT", re: pullRequestRoute(String.raw`/\d+`), body: isAllowedPullRequestUpdate, what: "update PR title/description/reviewers/draft/destination" },
+  { method: "POST", re: pullRequestRoute(String.raw`/\d+/comments`), what: "comment on PR" },
+  { method: "PUT", re: pullRequestRoute(String.raw`/\d+/comments/\d+`), body: isAllowedCommentUpdate, what: "edit a PR comment's text" },
+  { method: "POST", re: pullRequestRoute(String.raw`/\d+/comments/\d+/resolve`), what: "resolve a comment thread" },
+  { method: "DELETE", re: pullRequestRoute(String.raw`/\d+/comments/\d+/resolve`), what: "reopen a comment thread" },
+  { method: "POST", re: pullRequestRoute(String.raw`/\d+/approve`), what: "approve PR" },
+  { method: "DELETE", re: pullRequestRoute(String.raw`/\d+/approve`), what: "un-approve PR" },
+  { method: "POST", re: pullRequestRoute(String.raw`/\d+/request-changes`), what: "request changes on PR" },
+  { method: "DELETE", re: pullRequestRoute(String.raw`/\d+/request-changes`), what: "withdraw request-changes on PR" },
 ];
 
 /**
@@ -446,8 +487,9 @@ export function isWriteAllowed(method, path, body) {
 export const prepareWrite = (method, path, body) => {
   const json = body === undefined ? undefined : JSON.stringify(body);
   if (!isWriteAllowed(method, path, json === undefined ? undefined : JSON.parse(json))) {
+    const shown = typeof path === "string" ? path : "(a non-string path)"; // never stringify a refused non-string
     throw new Error(
-      `bbWrite refuses ${method} ${path}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
+      `bbWrite refuses ${method} ${shown}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
     );
   }
   return { url: BASE + path, json };
@@ -668,7 +710,7 @@ async function findPullRequestTemplate(workspace, repo, ref) {
  *  opaque create-PR error. Exported for tests. */
 export function toReviewer(s) {
   const v = String(s).trim();
-  const m = v.match(/^\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}?$/);
+  const m = v.match(new RegExp(`^\\{?(${UUID_SOURCE})\\}?$`));
   if (m) return { uuid: `{${m[1]}}` };
   if (v === "" || /\s/.test(v) || v.includes("@")) {
     throw new Error(
@@ -796,6 +838,22 @@ export const findUnexpectedChanges = (before, after, updated) =>
     }));
 
 /**
+ * Drop items whose `id` was already seen, keeping each one's first occurrence in
+ * order. A paginated listing can repeat an item when a page boundary shifts while
+ * new items are added. Exported for tests (pure — no network).
+ * @param {Array<{ id: unknown }>} items - e.g. raw comments from bbGetAll.
+ * @returns {Array<{ id: unknown }>} the items with unique ids, in first-seen order. Items are not copied.
+ */
+export const uniqueById = (items) => {
+  const seen = new Set();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+};
+
+/**
  * Group flat comment summaries (from commentSummary) into threads: each root gets
  * a nested `replies` array, in the order the comments were given. A reply whose
  * parent wasn't in the fetched set (e.g. cut off by `limit`) becomes a root marked
@@ -807,10 +865,7 @@ export const findUnexpectedChanges = (before, after, updated) =>
  * @returns {Array<object>} the thread roots, each a comment summary with optional nested `replies`.
  */
 export const buildCommentThreads = (comments) => {
-  const nodes = new Map();
-  for (const c of comments) {
-    if (!nodes.has(c.id)) nodes.set(c.id, { ...c, replies: [] });
-  }
+  const nodes = new Map(uniqueById(comments).map((c) => [c.id, { ...c, replies: [] }]));
   const roots = [];
   for (const node of nodes.values()) {
     const parent = node.parent_id !== undefined ? nodes.get(node.parent_id) : undefined;
@@ -933,7 +988,7 @@ const wrap = (fn) => async (args) => {
 // invariant the write allowlist relies on explicit at the input boundary, instead
 // of leaving it to enc() + the allowlist alone. Do NOT apply this to
 // ref/branch/path, which may contain slashes and rely on enc() to encode them.
-const SLUG_PATTERN = /^(?:\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}|(?!\.\.?$)[A-Za-z0-9._-]+)$/;
+const SLUG_PATTERN = new RegExp(`^(?:\\{${UUID_SOURCE}\\}|(?!\\.\\.?$)[A-Za-z0-9._-]+)$`);
 export const slug = z.string().regex(SLUG_PATTERN, "must be a Bitbucket slug (letters, digits, '.', '_', '-'; not '.' or '..') or a {uuid}");
 
 export const server = new McpServer({ name: "Bitbucket", version: "2.2.1" });
@@ -967,7 +1022,7 @@ server.registerTool(
   {
     title: "Get pull request",
     description:
-      "Fetch details for a single pull request, including description, reviewers (with the account_id that update_pull_request's remove_reviewers takes), and per-reviewer approval state.",
+      "Fetch details for a single pull request, including description, reviewers (each with account_id and uuid — either can be passed to update_pull_request's remove_reviewers), and per-reviewer approval state.",
     inputSchema: {
       workspace: slug,
       repo: slug,
@@ -1007,7 +1062,8 @@ server.registerTool(
     const { values, has_more } = await bbGetAll(`/repositories/${enc(workspace)}/${enc(repo)}/pullrequests/${pull_request_id}/comments`, {
       limit: clampLimit(limit),
     });
-    const comments = values.map(commentSummary);
+    // Dedupe once, before counting, so `count` and both views agree.
+    const comments = uniqueById(values).map(commentSummary);
     if (!threaded) return ok({ count: comments.length, has_more, comments });
     const threads = buildCommentThreads(comments);
     return ok({
@@ -1348,6 +1404,13 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
+  /**
+   * Post a comment (POST .../comments): general, inline (single or multi-line), or a reply.
+   * @param {{ workspace: string, repo: string, pull_request_id: number, content: string, file_path?: string,
+   *   line?: number, start_line?: number, line_side?: "new"|"old", parent_id?: number }} args - Validated tool input.
+   * @returns {Promise<object>} the tool result: the new comment's id, parent/inline anchor, and URL; an isError result
+   *   for a reply that also passes an anchor, or a line without a file. buildInline errors propagate to wrap().
+   */
   wrap(async ({ workspace, repo, pull_request_id, content, file_path, line, start_line, line_side, parent_id }) => {
     const body = commentText(content);
     if (parent_id !== undefined) {
@@ -1518,6 +1581,15 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
+  /**
+   * Open a PR (POST .../pullrequests), applying the repo's PR template when no description is given.
+   * @param {{ workspace: string, repo: string, title: string, source_branch: string, destination_branch?: string,
+   *   description?: string, reviewers?: string[], close_source_branch?: boolean, draft?: boolean,
+   *   use_template?: boolean }} args - Validated tool input.
+   * @returns {Promise<object>} the tool result: the new PR's summary and description, plus `template_applied`
+   *   (path or null) and, when a slashed branch couldn't be resolved, `template_skipped`. toReviewer errors
+   *   propagate to wrap().
+   */
   wrap(async ({ workspace, repo, title, source_branch, destination_branch, description, reviewers, close_source_branch, draft, use_template }) => {
     const body = {
       title,
@@ -1565,7 +1637,7 @@ server.registerTool(
     description:
       "Edit an OPEN pull request. Pass only what you want to change: 'title', 'description', 'add_reviewers' / 'remove_reviewers', 'draft' (false marks it ready for review, true converts it back to a draft), or 'destination_branch' (retarget). " +
       "Everything else stays as it is, including current reviewers unless you remove them. 'description' REPLACES the whole description, so to change part of it, read it with get_pull_request first and send the full edited text. " +
-      "Reviewers are account_ids or UUIDs: get_pull_request lists current reviewers' account_ids, and list_workspace_members finds new ones. The PR author can't be a reviewer. " +
+      "Reviewers are account_ids or UUIDs: get_pull_request lists current reviewers' account_ids and uuids, and list_workspace_members finds new ones. The PR author can't be a reviewer. " +
       "This tool cannot merge, decline, change the source branch, or change close_source_branch.",
     inputSchema: {
       workspace: slug,

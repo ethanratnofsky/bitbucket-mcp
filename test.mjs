@@ -29,6 +29,7 @@ const {
   buildCommentThreads,
   findUnexpectedChanges,
   prepareWrite,
+  uniqueById,
 } = await import("./server.js");
 
 let failures = 0;
@@ -134,6 +135,14 @@ check("encoded slash, lower case (%2f)", isWriteAllowed("POST", "/repositories/a
 check("encoded backslash (%5C)", isWriteAllowed("POST", "/repositories/a%5Cb/repo/pullrequests"), false);
 check("encoded dot inside a segment (%2e)", isWriteAllowed("POST", "/repositories/a%2eb/repo/pullrequests"), false);
 check("a non-string path (String object)", isWriteAllowed("POST", new String(WS)), false);
+check("double-encoded slash (%252F..%252F)", isWriteAllowed("POST", "/repositories/x%252F..%252F../snippets/pullrequests/42/comments"), false);
+check("double-encoded dot segment (%252e%252e)", isWriteAllowed("POST", "/repositories/%252e%252e/r/pullrequests"), false);
+check("an encoded NUL (%00)", isWriteAllowed("POST", "/repositories/a%00b/r/pullrequests"), false);
+check("an encoded fullwidth dot segment", isWriteAllowed("POST", "/repositories/%EF%BC%8E%EF%BC%8E/r/pullrequests"), false);
+check("a ';' in a segment", isWriteAllowed("POST", "/repositories/a;b/r/pullrequests"), false);
+check("an '@' in a segment", isWriteAllowed("POST", "/repositories/a@b/r/pullrequests"), false);
+check("braces around something that isn't a uuid", isWriteAllowed("POST", "/repositories/%7Bnot-a-uuid%7D/r/pullrequests"), false);
+check("a lower-case-encoded upper-case uuid is fine", isWriteAllowed("POST", "/repositories/%7b504C3B62-8120-4F0C-A7BC-87800B9D6F70%7d/r/pullrequests"), true);
 
 process.stdout.write("write allowlist — REFUSED: PUT body fields of the wrong type:\n");
 const PR42 = `${WS}/42`;
@@ -161,9 +170,14 @@ check("a bodiless write sends no JSON", prepareWrite("POST", `${PR42}/approve`).
 const smuggler = Object.assign(Object.create({ toJSON: () => ({ state: "MERGED", close_source_branch: true }) }), { title: "t" });
 check("(the smuggling body's own keys alone would pass the body rule)", isWriteAllowed("PUT", PR42, smuggler), true);
 throws("refuses a body whose inherited toJSON serializes to a merge", () => prepareWrite("PUT", PR42, smuggler));
-let reads = 0;
-const shifty = { toString: () => (++reads === 1 ? PR42 : `${PR42}/merge`) }; // checked as one path, sent as another
-throws("refuses a non-string path (could stringify differently later)", () => prepareWrite("POST", shifty));
+// A path object can return a different string on every read: it could pass the
+// allowlist as .../approve and then be sent as .../merge. So a non-string path
+// must be refused before it is ever stringified — even one that always reads as
+// an allowed path.
+let pathReads = 0;
+const allowedLooking = { toString: () => (pathReads++, `${PR42}/approve`) };
+throws("refuses a non-string path even when it reads as an allowed one", () => prepareWrite("POST", allowedLooking));
+check("…without ever stringifying it", pathReads, 0);
 throws("refuses a disallowed write outright", () => prepareWrite("POST", `${PR42}/merge`));
 
 process.stdout.write("slug input invariant (workspace/repo cannot contain '/' or be a dot segment):\n");
@@ -362,6 +376,11 @@ check(
 const dropped = findUnexpectedChanges(BEFORE, { ...BEFORE, reviewers: [], close_source_branch: false }, ["title"]);
 check("dropped reviewers and a reset close_source_branch are flagged", dropped.map((c) => c.field), ["reviewers", "close_source_branch"]);
 check("close_source_branch says it can only be restored in the UI", dropped[1].restore.includes("Bitbucket UI"), true);
+
+process.stdout.write("uniqueById (drop repeats, keep first occurrence):\n");
+check("keeps first occurrences in order", uniqueById([{ id: 2, v: "a" }, { id: 1 }, { id: 2, v: "b" }, { id: 3 }]), [{ id: 2, v: "a" }, { id: 1 }, { id: 3 }]);
+check("no repeats → unchanged", uniqueById([{ id: 1 }, { id: 2 }]), [{ id: 1 }, { id: 2 }]);
+check("empty → empty", uniqueById([]), []);
 
 process.stdout.write("buildCommentThreads (flat comments → nested threads):\n");
 check(
