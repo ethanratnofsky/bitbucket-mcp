@@ -227,6 +227,10 @@ process.stdout.write("toReviewer parsing:\n");
 check("account_id with colon", toReviewer("557058:f0c3abcd-1234-5678-9abc-def012345678"), { account_id: "557058:f0c3abcd-1234-5678-9abc-def012345678" });
 check("bare uuid → braces", toReviewer("504c3b62-8120-4f0c-a7bc-87800b9d6f70"), { uuid: "{504c3b62-8120-4f0c-a7bc-87800b9d6f70}" });
 check("brace-wrapped uuid", toReviewer("{504c3b62-8120-4f0c-a7bc-87800b9d6f70}"), { uuid: "{504c3b62-8120-4f0c-a7bc-87800b9d6f70}" });
+check("stray brace on one side → normalised", toReviewer("{504c3b62-8120-4f0c-a7bc-87800b9d6f70"), { uuid: "{504c3b62-8120-4f0c-a7bc-87800b9d6f70}" });
+// Both anchors matter: text before or after a UUID makes it an account_id, never a truncated UUID.
+check("a uuid with trailing text is not a uuid", toReviewer("504c3b62-8120-4f0c-a7bc-87800b9d6f70x"), { account_id: "504c3b62-8120-4f0c-a7bc-87800b9d6f70x" });
+check("a uuid with leading text is not a uuid", toReviewer("x504c3b62-8120-4f0c-a7bc-87800b9d6f70"), { account_id: "x504c3b62-8120-4f0c-a7bc-87800b9d6f70" });
 check("opaque account_id", toReviewer("712020:abc"), { account_id: "712020:abc" });
 throws("rejects an email", () => toReviewer("jane@example.com"));
 throws("rejects a display name with a space", () => toReviewer("Jane Doe"));

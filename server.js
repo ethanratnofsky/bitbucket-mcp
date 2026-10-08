@@ -39,13 +39,16 @@
  *     in each allowlisted path are constrained to digits. The workspace/repo
  *     segments can't escape their place in the path:
  *       - a slash, a "%" escape (single- or double-encoded), or any character
- *         outside [A-Za-z0-9._-] is refused at three layers: the `slug` input
- *         schema; the allowlist's own segment pattern (PATH_SEGMENT), which admits
- *         only those characters or an encoded {uuid} (%7B…%7D); and
- *         isCanonicalPath()'s encoded-separator check (%2F, %5C, %2E). enc() at
- *         every call site is NOT one of those layers: it only makes %2F the one
- *         form a slash can take in a path, and Bitbucket may decode %2F when
- *         routing — which is exactly why the other three refuse it;
+ *         outside [A-Za-z0-9._-] is refused at TWO layers: the `slug` input
+ *         schema, and the allowlist's own segment pattern (PATH_SEGMENT), which
+ *         admits only those characters or an encoded {uuid} (%7B…%7D). A slash or
+ *         backslash also hits a third: enc() turns it into %2F / %5C, which
+ *         isCanonicalPath()'s encoded-separator check (%2F, %5C, %2E) refuses.
+ *         That check does NOT catch other escapes (%252F, %3B, %20, …), so it is
+ *         no backstop for the whole class — loosening PATH_SEGMENT would leave
+ *         only `slug` guarding them. enc() itself is not a layer: it only makes
+ *         %2F the one form a slash can take, and Bitbucket may decode %2F when
+ *         routing — which is why these layers refuse it;
  *       - a "." / ".." dot segment is blocked at two: the `slug` input schema, and
  *         isCanonicalPath() in bbWrite, which refuses any path the URL parser would
  *         rewrite (collapsed dot segments, their %2e forms, backslashes) or that
@@ -299,7 +302,9 @@ const ENCODED_SEPARATOR = /%(2f|5c|2e)/i;
  * allowlist pattern yet hit a different endpoint. Any path the parser would
  * rewrite — or that hides an encoded separator a server might decode — is refused.
  * Exported so this layer can be tested on its own, independent of the
- * allowlist's segment pattern (which currently also refuses these escapes).
+ * allowlist's segment pattern (which currently also refuses these escapes). It
+ * catches dot segments, backslashes, and %2F / %5C / %2E only — NOT other escapes
+ * like %252F or %3B, which only `slug` and PATH_SEGMENT refuse.
  * @param {unknown} path - Request path relative to /2.0, already percent-encoded.
  * @returns {boolean} true only for a string whose parsed URL keeps the API origin and exactly this path,
  *   with no query, fragment, or encoded "/", "\", or ".".
@@ -718,14 +723,21 @@ async function findPullRequestTemplate(workspace, repo, ref) {
   return null;
 }
 
-// A reviewer given as a UUID, bare or brace-wrapped; group 1 is the bare UUID.
+// A reviewer given as a UUID: bare, brace-wrapped, or with a stray brace on one
+// side (all normalised to {uuid}); anchored at both ends, so "<uuid>x" is NOT a
+// UUID. Group 1 is the bare UUID.
 const REVIEWER_UUID_PATTERN = new RegExp(`^\\{?(${UUID_SOURCE})\\}?$`);
 
-/** Map a reviewer string to Bitbucket's reviewer object. A bare UUID (optionally
- *  brace-wrapped) becomes { uuid }; an account_id becomes { account_id }. Rejects
- *  values that obviously aren't an identifier (an email or a display name with a
- *  space) so the common mistake fails fast with a clear message instead of an
- *  opaque create-PR error. Exported for tests. */
+/**
+ * Map a reviewer string to Bitbucket's reviewer object. A UUID (see
+ * REVIEWER_UUID_PATTERN) becomes `{ uuid: "{…}" }`; anything else becomes
+ * `{ account_id }`. Values that obviously aren't an identifier (an email, or a
+ * display name with a space) fail fast with a clear message instead of an opaque
+ * create-PR error. Exported for tests.
+ * @param {string} s - An account_id or UUID; surrounding whitespace is trimmed.
+ * @returns {{ uuid: string } | { account_id: string }} the reviewer reference.
+ * @throws {Error} when the value is empty, contains whitespace, or contains '@'.
+ */
 export function toReviewer(s) {
   const v = String(s).trim();
   const m = v.match(REVIEWER_UUID_PATTERN);
@@ -1002,10 +1014,11 @@ const wrap = (fn) => async (args) => {
 // slugs of letters, digits, '.', '_', '-' (never just "." or "..", which the URL
 // parser would collapse — e.g. workspace ".." turns a comment PUT into a snippet
 // endpoint), or a brace-wrapped UUID. So no slash, backslash, '%', or other
-// character that could change which endpoint a path reaches. This makes the
-// invariant the write allowlist relies on explicit at the input boundary, instead
-// of leaving it to enc() + the allowlist alone. Do NOT apply this to
-// ref/branch/path, which may contain slashes and rely on enc() to encode them.
+// character that could change which endpoint a path reaches. This enforces the
+// write allowlist's invariant at the input boundary; the allowlist's PATH_SEGMENT
+// then enforces the same character set again rather than trusting it (enc() is
+// not a guard — it only encodes). Do NOT apply this to ref/branch/path, which may
+// contain slashes and rely on enc() to encode them.
 const SLUG_PATTERN = new RegExp(`^(?:\\{${UUID_SOURCE}\\}|(?!\\.\\.?$)[A-Za-z0-9._-]+)$`);
 export const slug = z.string().regex(SLUG_PATTERN, "must be a Bitbucket slug (letters, digits, '.', '_', '-'; not '.' or '..') or a {uuid}");
 
