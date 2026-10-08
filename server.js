@@ -39,11 +39,13 @@
  *     in each allowlisted path are constrained to digits. The workspace/repo
  *     segments can't escape their place in the path:
  *       - a slash, a "%" escape (single- or double-encoded), or any character
- *         outside [A-Za-z0-9._-] is handled at three layers: the `slug` input
- *         schema rejects it; enc() at every call site encodes it, so it can't act
- *         as a separator; and the allowlist's own segment pattern (PATH_SEGMENT)
- *         refuses the result, admitting only those characters or an encoded
- *         {uuid} (%7B…%7D);
+ *         outside [A-Za-z0-9._-] is refused at three layers: the `slug` input
+ *         schema; the allowlist's own segment pattern (PATH_SEGMENT), which admits
+ *         only those characters or an encoded {uuid} (%7B…%7D); and
+ *         isCanonicalPath()'s encoded-separator check (%2F, %5C, %2E). enc() at
+ *         every call site is NOT one of those layers: it only makes %2F the one
+ *         form a slash can take in a path, and Bitbucket may decode %2F when
+ *         routing — which is exactly why the other three refuse it;
  *       - a "." / ".." dot segment is blocked at two: the `slug` input schema, and
  *         isCanonicalPath() in bbWrite, which refuses any path the URL parser would
  *         rewrite (collapsed dot segments, their %2e forms, backslashes) or that
@@ -296,11 +298,13 @@ const ENCODED_SEPARATOR = /%(2f|5c|2e)/i;
  * string like `/repositories/../snippets/pullrequests/1/comments/2` can match an
  * allowlist pattern yet hit a different endpoint. Any path the parser would
  * rewrite — or that hides an encoded separator a server might decode — is refused.
+ * Exported so this layer can be tested on its own, independent of the
+ * allowlist's segment pattern (which currently also refuses these escapes).
  * @param {unknown} path - Request path relative to /2.0, already percent-encoded.
  * @returns {boolean} true only for a string whose parsed URL keeps the API origin and exactly this path,
  *   with no query, fragment, or encoded "/", "\", or ".".
  */
-const isCanonicalPath = (path) => {
+export const isCanonicalPath = (path) => {
   if (typeof path !== "string" || ENCODED_SEPARATOR.test(path)) return false;
   try {
     const url = new URL(BASE + path);
@@ -394,9 +398,20 @@ const PR_FIELD_RULES = Object.freeze({
   [PR_FIELD.DRAFT]: isBoolean,
   [PR_FIELD.DESTINATION]: isBranchRef,
 });
+/**
+ * Find a field that has no type rule of its own. Only OWN properties count, so a
+ * field named like an inherited Object method ("constructor", "toString", …)
+ * can't pass by borrowing the prototype's function. Exported for tests (pure).
+ * @param {string[]} fields - Field names that must each have a rule.
+ * @param {object} rules - Map of field name → predicate.
+ * @returns {string|undefined} the first field without an own function rule, or undefined when all have one.
+ */
+export const findFieldWithoutRule = (fields, rules) =>
+  fields.find((f) => !(Object.hasOwn(rules, f) && typeof rules[f] === "function"));
+
 // Fail at startup — not on the first update — if a sendable field is ever added
 // to PR_FIELD without a type rule here.
-const fieldWithoutRule = PR_UPDATE_FIELDS.find((f) => typeof PR_FIELD_RULES[f] !== "function");
+const fieldWithoutRule = findFieldWithoutRule(PR_UPDATE_FIELDS, PR_FIELD_RULES);
 if (fieldWithoutRule) throw new Error(`[bitbucket-mcp] PR_FIELD_RULES has no type rule for "${fieldWithoutRule}".`);
 
 /**
@@ -703,6 +718,9 @@ async function findPullRequestTemplate(workspace, repo, ref) {
   return null;
 }
 
+// A reviewer given as a UUID, bare or brace-wrapped; group 1 is the bare UUID.
+const REVIEWER_UUID_PATTERN = new RegExp(`^\\{?(${UUID_SOURCE})\\}?$`);
+
 /** Map a reviewer string to Bitbucket's reviewer object. A bare UUID (optionally
  *  brace-wrapped) becomes { uuid }; an account_id becomes { account_id }. Rejects
  *  values that obviously aren't an identifier (an email or a display name with a
@@ -710,7 +728,7 @@ async function findPullRequestTemplate(workspace, repo, ref) {
  *  opaque create-PR error. Exported for tests. */
 export function toReviewer(s) {
   const v = String(s).trim();
-  const m = v.match(new RegExp(`^\\{?(${UUID_SOURCE})\\}?$`));
+  const m = v.match(REVIEWER_UUID_PATTERN);
   if (m) return { uuid: `{${m[1]}}` };
   if (v === "" || /\s/.test(v) || v.includes("@")) {
     throw new Error(
@@ -1544,6 +1562,14 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
+  /**
+   * Set or withdraw your review verdict (POST/DELETE .../approve or .../request-changes).
+   * @param {{ workspace: string, repo: string, pull_request_id: number,
+   *   action: "approve"|"unapprove"|"request-changes"|"unrequest-changes" }} args - Validated tool input.
+   * @returns {Promise<object>} the tool result: `{ action, pull_request_id, result }`, where result is your
+   *   participant state after a POST or "removed" after a DELETE. Withdrawing a verdict you don't hold (404) is
+   *   reported as already neutral; any other failure propagates to wrap().
+   */
   wrap(async ({ workspace, repo, pull_request_id, action }) => {
     const sub = action === "approve" || action === "unapprove" ? "approve" : "request-changes";
     const method = action.startsWith("un") ? "DELETE" : "POST";

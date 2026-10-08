@@ -30,6 +30,8 @@ const {
   findUnexpectedChanges,
   prepareWrite,
   uniqueById,
+  isCanonicalPath,
+  findFieldWithoutRule,
 } = await import("./server.js");
 
 let failures = 0;
@@ -159,6 +161,30 @@ check("reviewer as a string", isWriteAllowed("PUT", PR42, { reviewers: ["557058:
 check("comment raw as an object", isWriteAllowed("PUT", `${PR42}/comments/5`, { content: { raw: { html: "x" } } }), false);
 check("an empty reviewers list is fine", isWriteAllowed("PUT", PR42, { title: "t", reviewers: [] }), true);
 check("an empty description is fine", isWriteAllowed("PUT", PR42, { title: "t", description: "" }), true);
+
+// isCanonicalPath is its own layer: tested directly, so it keeps refusing these
+// even if the allowlist's segment pattern is ever loosened.
+process.stdout.write("isCanonicalPath (on its own, independent of the allowlist):\n");
+check("accepts a plain path", isCanonicalPath(`${WS}/42/approve`), true);
+check("accepts an encoded {uuid} segment", isCanonicalPath(`/repositories/%7B504c3b62-8120-4f0c-a7bc-87800b9d6f70%7D/r/pullrequests`), true);
+check("refuses an encoded slash (%2F)", isCanonicalPath("/repositories/a%2Fb/r/pullrequests"), false);
+check("refuses an encoded slash, lower case (%2f)", isCanonicalPath("/repositories/a%2fb/r/pullrequests"), false);
+check("refuses an encoded backslash (%5C)", isCanonicalPath("/repositories/a%5Cb/r/pullrequests"), false);
+check("refuses an encoded dot (%2E)", isCanonicalPath("/repositories/a%2Eb/r/pullrequests"), false);
+check("refuses a '..' segment", isCanonicalPath("/repositories/../snippets/pullrequests"), false);
+check("refuses a '.' segment", isCanonicalPath("/repositories/a/./pullrequests"), false);
+check("refuses a backslash", isCanonicalPath("/repositories/a\\b/r/pullrequests"), false);
+check("refuses a query string", isCanonicalPath(`${WS}?x=1`), false);
+check("refuses a fragment", isCanonicalPath(`${WS}#x`), false);
+check("refuses a non-string", isCanonicalPath(new String(WS)), false);
+
+process.stdout.write("findFieldWithoutRule (startup check that every sendable PR field has a type rule):\n");
+const RULE = () => true;
+check("every field has an own rule → none missing", findFieldWithoutRule(["title", "draft"], { title: RULE, draft: RULE }), undefined);
+check("a field with no rule is reported", findFieldWithoutRule(["title", "label"], { title: RULE }), "label");
+check("a rule that isn't a function doesn't count", findFieldWithoutRule(["title"], { title: true }), "title");
+check("an inherited name ('constructor') doesn't borrow Object's function", findFieldWithoutRule(["constructor"], {}), "constructor");
+check("an inherited name ('toString') doesn't either", findFieldWithoutRule(["toString"], Object.freeze({})), "toString");
 
 process.stdout.write("prepareWrite (what is checked is exactly what is sent):\n");
 check(
@@ -410,15 +436,17 @@ check(
   [{ id: 9, parent_id: 7, content: "orphan", parent_not_fetched: true }]
 );
 check("no comments → no threads", buildCommentThreads([]), []);
+// The repeats carry DIFFERENT content, so the test can tell which copy was kept:
+// a plain Map keyed by id would keep the first position but the LAST value.
 check(
-  "a repeated comment id is kept once, at its first position (no crash)",
+  "a repeated comment id is kept once — the first copy, at its first position (no crash)",
   buildCommentThreads([
-    { id: 1, content: "root" },
-    { id: 2, parent_id: 1, content: "reply" },
-    { id: 2, parent_id: 1, content: "reply" },
-    { id: 1, content: "root" },
+    { id: 1, content: "root v1" },
+    { id: 2, parent_id: 1, content: "reply v1" },
+    { id: 2, parent_id: 1, content: "reply v2" },
+    { id: 1, content: "root v2" },
   ]),
-  [{ id: 1, content: "root", replies: [{ id: 2, parent_id: 1, content: "reply" }] }]
+  [{ id: 1, content: "root v1", replies: [{ id: 2, parent_id: 1, content: "reply v1" }] }]
 );
 const input = [{ id: 1 }, { id: 2, parent_id: 1 }];
 buildCommentThreads(input);
