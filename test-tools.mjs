@@ -28,6 +28,7 @@ const EXPECTED = [
   "review_pull_request",
   "create_pull_request",
   "update_pull_request",
+  "upload_pull_request_image",
 ];
 
 // The tools that can change anything in Bitbucket. Every other tool must
@@ -39,6 +40,7 @@ const WRITE_TOOLS = new Set([
   "review_pull_request",
   "create_pull_request",
   "update_pull_request",
+  "upload_pull_request_image",
 ]);
 
 const transport = new StdioClientTransport({

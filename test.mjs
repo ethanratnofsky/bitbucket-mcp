@@ -32,6 +32,9 @@ const {
   uniqueById,
   isCanonicalPath,
   findFieldWithoutRule,
+  detectImageType,
+  buildDownloadName,
+  DOWNLOAD_NAME_RE,
 } = await import("./server.js");
 
 let failures = 0;
@@ -266,6 +269,77 @@ const allowedLooking = { toString: () => (pathReads++, `${PR42}/approve`) };
 throws("refuses a non-string path even when it reads as an allowed one", () => prepareWrite("POST", allowedLooking));
 check("…without ever stringifying it", pathReads, 0);
 throws("refuses a disallowed write outright", () => prepareWrite("POST", `${PR42}/merge`));
+
+process.stdout.write("image upload (POST .../downloads) — allowlist and form rule:\n");
+const DL = "/repositories/acme/some-repo/downloads";
+const GOOD_NAME = "20261029T203413Z-0a1b2c3d-login-page.png";
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+/**
+ * Build an upload form the way the tool does.
+ * @param {Array<[string, BlobPart[], string, string]>} files - [field, parts, mime, filename] per entry.
+ * @returns {FormData} the form.
+ */
+const formOf = (...files) => {
+  const f = new FormData();
+  for (const [field, parts, mime, name] of files) f.append(field, new Blob(parts, { type: mime }), name);
+  return f;
+};
+const goodForm = () => formOf(["files", [PNG], "image/png", GOOD_NAME]);
+check("permits one uniquely-named PNG", isWriteAllowed("POST", DL, goodForm()), true);
+check("permits a uuid repo segment", isWriteAllowed("POST", `/repositories/${encodeURIComponent("{504c3b62-8120-4f0c-a7bc-87800b9d6f70}")}/r/downloads`, goodForm()), true);
+check("refuses a name without the unique prefix (could replace an existing download)", isWriteAllowed("POST", DL, formOf(["files", [PNG], "image/png", "login-page.png"])), false);
+check("refuses a name whose extension disagrees with its type", isWriteAllowed("POST", DL, formOf(["files", [PNG], "image/png", GOOD_NAME.replace(".png", ".gif")])), false);
+check("refuses a non-image type", isWriteAllowed("POST", DL, formOf(["files", ["#!/bin/sh"], "text/plain", GOOD_NAME.replace(".png", ".txt")])), false);
+check("refuses SVG (scriptable)", isWriteAllowed("POST", DL, formOf(["files", ["<svg/>"], "image/svg+xml", GOOD_NAME])), false);
+check("refuses two files in one upload", isWriteAllowed("POST", DL, formOf(["files", [PNG], "image/png", GOOD_NAME], ["files", [PNG], "image/png", GOOD_NAME.replace("0a1b", "ffff")])), false);
+check("refuses a field other than 'files'", isWriteAllowed("POST", DL, formOf(["file", [PNG], "image/png", GOOD_NAME])), false);
+check("refuses an empty file", isWriteAllowed("POST", DL, formOf(["files", [], "image/png", GOOD_NAME])), false);
+check("refuses a file over 10 MiB", isWriteAllowed("POST", DL, formOf(["files", [new Uint8Array(10 * 1024 * 1024 + 1)], "image/png", GOOD_NAME])), false);
+const stringField = new FormData();
+stringField.append("files", "not a file");
+check("refuses a string field", isWriteAllowed("POST", DL, stringField), false);
+check("refuses a JSON body on the downloads endpoint", isWriteAllowed("POST", DL, { files: GOOD_NAME }), false);
+check("refuses a bodiless POST to downloads", isWriteAllowed("POST", DL), false);
+check("refuses DELETE of a download", isWriteAllowed("DELETE", `${DL}/${GOOD_NAME}`), false);
+check("refuses DELETE of the downloads collection", isWriteAllowed("DELETE", DL), false);
+check("refuses PUT to downloads", isWriteAllowed("PUT", DL, goodForm()), false);
+check("refuses an upload to a sub-path", isWriteAllowed("POST", `${DL}/${GOOD_NAME}`, goodForm()), false);
+check("refuses a '..' repo segment", isWriteAllowed("POST", "/repositories/acme/../downloads", goodForm()), false);
+check("refuses a form on a JSON endpoint with no body rule (comment POST)", isWriteAllowed("POST", `${PR42}/comments`, goodForm()), false);
+check("refuses a form on the create-PR endpoint", isWriteAllowed("POST", WS, goodForm()), false);
+const callerForm = goodForm();
+const prepared = prepareWrite("POST", DL, callerForm);
+callerForm.append("files", new Blob(["x"], { type: "text/plain" }), "evil.txt");
+check("prepareWrite sends a copy, so later changes to the caller's form don't reach the wire", [...prepared.form.keys()].length, 1);
+check("…and sends no JSON for a form", prepared.json, undefined);
+throws("prepareWrite refuses a badly-named upload", () => prepareWrite("POST", DL, formOf(["files", [PNG], "image/png", "x.png"])));
+
+process.stdout.write("image upload — detectImageType (by contents):\n");
+check("PNG", detectImageType(PNG)?.mime, "image/png");
+check("JPEG", detectImageType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]))?.mime, "image/jpeg");
+check("GIF89a", detectImageType(new TextEncoder().encode("GIF89a..."))?.mime, "image/gif");
+check("GIF87a", detectImageType(new TextEncoder().encode("GIF87a..."))?.mime, "image/gif");
+check("WebP", detectImageType(new TextEncoder().encode("RIFF\0\0\0\0WEBPVP8 "))?.mime, "image/webp");
+check("a RIFF that isn't WebP (WAV)", detectImageType(new TextEncoder().encode("RIFF\0\0\0\0WAVEfmt ")), null);
+check("SVG", detectImageType(new TextEncoder().encode("<svg xmlns='http://www.w3.org/2000/svg'/>")), null);
+check("a text file", detectImageType(new TextEncoder().encode("hello")), null);
+check("a truncated PNG header", detectImageType(PNG.slice(0, 4)), null);
+check("empty", detectImageType(new Uint8Array()), null);
+
+process.stdout.write("image upload — buildDownloadName (unique, sanitized):\n");
+const NOW = new Date("2026-10-29T20:34:13.854Z");
+const T = { png: detectImageType(PNG), jpeg: detectImageType(new Uint8Array([0xff, 0xd8, 0xff])) };
+check("prefixes a UTC timestamp and the random suffix", buildDownloadName("login-page.png", T.png, NOW, "0a1b2c3d"), GOOD_NAME);
+check("sanitizes spaces and odd characters", buildDownloadName("Screen Shot 2026-10-29 at 4.34.13 PM.png", T.png, NOW, "0a1b2c3d"), "20261029T203413Z-0a1b2c3d-Screen-Shot-2026-10-29-at-4.34.13-PM.png");
+check("drops any directory part", buildDownloadName("../../etc/x.png", T.png, NOW, "0a1b2c3d"), "20261029T203413Z-0a1b2c3d-x.png");
+check("adds the extension when missing", buildDownloadName("diagram", T.png, NOW, "0a1b2c3d"), "20261029T203413Z-0a1b2c3d-diagram.png");
+check("keeps a non-image extension as part of the name", buildDownloadName("notes.final", T.png, NOW, "0a1b2c3d"), "20261029T203413Z-0a1b2c3d-notes.final.png");
+check("normalizes .jpeg / .JPG to .jpg", [buildDownloadName("a.jpeg", T.jpeg, NOW, "0a1b2c3d"), buildDownloadName("a.JPG", T.jpeg, NOW, "0a1b2c3d")], ["20261029T203413Z-0a1b2c3d-a.jpg", "20261029T203413Z-0a1b2c3d-a.jpg"]);
+check("an all-symbol name falls back to 'image'", buildDownloadName("日本語.png", T.png, NOW, "0a1b2c3d"), "20261029T203413Z-0a1b2c3d-image.png");
+check("caps a long stem", buildDownloadName(`${"a".repeat(300)}.png`, T.png, NOW, "0a1b2c3d").length, "20261029T203413Z-0a1b2c3d-".length + 80 + ".png".length);
+check("every built name passes the allowlist's name pattern", ["x.png", "Screen Shot.png", "日本語", `${"b".repeat(300)}.png`, "-.-.png"].every((n) => DOWNLOAD_NAME_RE.test(buildDownloadName(n, T.png))), true);
+check("two names built at the same moment differ (random suffix)", buildDownloadName("a.png", T.png, NOW) !== buildDownloadName("a.png", T.png, NOW), true);
+check("a mismatched image extension is refused", /contents are image\/png/.test(errorOf(() => buildDownloadName("photo.jpg", T.png, NOW)) ?? ""), true);
 
 process.stdout.write("slug input invariant (workspace/repo cannot contain '/' or be a dot segment):\n");
 check("accepts a plain slug", slug.safeParse("acme").success, true);

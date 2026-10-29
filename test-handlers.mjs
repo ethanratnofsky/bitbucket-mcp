@@ -22,6 +22,10 @@ const BOB = { display_name: "Bob", account_id: "557058:bob", uuid: "{bbbbbbbb-00
 let requests = [];
 let prs;
 let comments;
+/** Download names the fake repo already holds. */
+let downloads;
+/** How many upcoming download-existence checks should report a (simulated) name collision. */
+let collisions;
 
 /**
  * Reset the fake Bitbucket state and the request log before each scenario.
@@ -33,6 +37,8 @@ let comments;
  */
 const reset = () => {
   requests = [];
+  downloads = new Set();
+  collisions = 0;
   const base = {
     title: "Old title",
     summary: { raw: "Old body" },
@@ -81,8 +87,27 @@ const byRef = (r) => [ALICE, BOB].find((u) => u.uuid === r.uuid || u.account_id 
 globalThis.fetch = async (url, init = {}) => {
   const { pathname } = new URL(url);
   const method = init.method || "GET";
-  const body = init.body ? JSON.parse(init.body) : undefined;
+  const isForm = init.body instanceof FormData;
+  const body = isForm
+    ? { form: [...init.body.entries()].map(([k, v]) => [k, v.name, v.type, v.size]), content_type_header: init.headers?.["Content-Type"] ?? null }
+    : init.body
+      ? JSON.parse(init.body)
+      : undefined;
   requests.push({ method, path: pathname, ...(body !== undefined ? { body } : {}) });
+  if (pathname === "/2.0/repositories/acme/app" && method === "GET") return reply(200, { links: { html: { href: "https://bitbucket.org/acme/app" } } });
+  let d;
+  if ((d = pathname.match(/^\/2\.0\/repositories\/acme\/app\/downloads\/([^/]+)$/)) && method === "GET") {
+    if (init.redirect !== "manual") return reply(500, { error: { message: "fake: existence check must not follow redirects" } });
+    if (collisions > 0 || downloads.has(decodeURIComponent(d[1]))) {
+      collisions = Math.max(0, collisions - 1);
+      return new Response(null, { status: 302, headers: { location: "https://bbuseruploads.s3.amazonaws.com/x" } });
+    }
+    return reply(404, { type: "error", error: { message: "not found" } });
+  }
+  if (pathname === "/2.0/repositories/acme/app/downloads" && method === "POST") {
+    for (const [, v] of init.body.entries()) downloads.add(v.name);
+    return new Response(null, { status: 201 });
+  }
   if (!PR_PREFIX.test(pathname)) return reply(500, { error: { message: `fake: unexpected ${method} ${pathname}` } });
   const p = pathname.replace(PR_PREFIX, "");
   let m;
@@ -123,11 +148,13 @@ await client.connect(clientTransport);
  * returned) come back as an isError result so every scenario reads the same.
  * @param {string} name - Tool name.
  * @param {object} args - Tool arguments.
+ * @param {() => void} [setup] - Adjusts the fresh fake state before the call.
  * @returns {Promise<{ isError: boolean, text: string, json?: any, writes: Array<object> }>} the result,
  *   its parsed JSON (when it is JSON), and the non-GET requests the call sent.
  */
-const call = async (name, args) => {
+const call = async (name, args, setup) => {
   reset();
+  setup?.();
   let result;
   try {
     result = await client.callTool({ name, arguments: args });
@@ -233,6 +260,54 @@ check("reviewers carry display_name, account_id, and uuid", r.json?.reviewers, [
   { display_name: "Alice", account_id: ALICE.account_id, uuid: ALICE.uuid },
   { display_name: "Bob", account_id: BOB.account_id, uuid: BOB.uuid },
 ]);
+
+process.stdout.write("upload_pull_request_image:\n");
+const { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, rmSync } = await import("node:fs");
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
+const dir = mkdtempSync(join(process.env.KIROCREW_SCRATCH || tmpdir(), "bbmcp-upload-"));
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const png = join(dir, "Login Page.png");
+writeFileSync(png, PNG_BYTES);
+writeFileSync(join(dir, "fake.png"), "not really a png");
+writeFileSync(join(dir, "empty.png"), "");
+writeFileSync(join(dir, "big.png"), Buffer.concat([PNG_BYTES, Buffer.alloc(10 * 1024 * 1024)]));
+mkdirSync(join(dir, "folder.png"));
+symlinkSync(png, join(dir, "link.png"));
+const UP = { workspace: "acme", repo: "app" };
+const NAME = /^\d{8}T\d{6}Z-[0-9a-f]{8}-Login-Page\.png$/;
+
+r = await call("upload_pull_request_image", { ...UP, file_path: png });
+const sent = r.writes[0];
+check("sends exactly one write: a multipart POST to .../downloads", [r.writes.length, sent?.method, sent?.path], [1, "POST", "/2.0/repositories/acme/app/downloads"]);
+check("…with one 'files' entry: the PNG under a unique name", [sent?.body?.form?.length, sent?.body?.form?.[0]?.[0], NAME.test(sent?.body?.form?.[0]?.[1]), sent?.body?.form?.[0]?.[2], sent?.body?.form?.[0]?.[3]], [1, "files", true, "image/png", PNG_BYTES.length]);
+check("…leaving Content-Type to fetch (so the multipart boundary is set)", sent?.body?.content_type_header, null);
+check("checks the name is free before uploading, and confirms after", requests.filter((q) => q.method === "GET" && q.path.includes("/downloads/")).length, 2);
+check("returns the web URL and a ready-to-paste snippet", [r.isError, r.json?.url, r.json?.markdown], [false, `https://bitbucket.org/acme/app/downloads/${r.json?.filename}`, `![Login Page](https://bitbucket.org/acme/app/downloads/${r.json?.filename})`]);
+check("…with no warning when the upload is confirmed", r.json?.warning, undefined);
+
+r = await call("upload_pull_request_image", { ...UP, file_path: png, filename: "after fix.png" });
+check("an explicit filename is sanitized and prefixed", /^\d{8}T\d{6}Z-[0-9a-f]{8}-after-fix\.png$/.test(r.json?.filename), true);
+r = await call("upload_pull_request_image", { ...UP, file_path: png }, () => (collisions = 1));
+check("a taken name is skipped for a fresh one (no overwrite)", [r.isError, r.writes.length, requests.filter((q) => q.method === "GET" && q.path.includes("/downloads/")).length], [false, 1, 3]);
+r = await call("upload_pull_request_image", { ...UP, file_path: png }, () => (collisions = 3));
+check("three taken names in a row → refused with no write", [r.isError, r.writes.length], [true, 0]);
+r = await call("upload_pull_request_image", { ...UP, file_path: join(dir, "link.png") });
+check("a symlink to an image is followed", [r.isError, r.writes.length], [false, 1]);
+
+const refused = async (label, args, re) => {
+  const res = await call("upload_pull_request_image", { ...UP, ...args });
+  check(`${label} → refused before any request`, [res.isError, requests.length, re.test(res.text)], [true, 0, true]);
+};
+await refused("a relative path", { file_path: "Login Page.png" }, /absolute/);
+await refused("a missing file", { file_path: join(dir, "nope.png") }, /No file/);
+await refused("a directory", { file_path: join(dir, "folder.png") }, /not a regular file/);
+await refused("an empty file", { file_path: join(dir, "empty.png") }, /empty/);
+await refused("a file over 10 MiB", { file_path: join(dir, "big.png") }, /limit/);
+await refused("a .png that isn't a PNG", { file_path: join(dir, "fake.png") }, /not a PNG, JPEG, GIF, or WebP/);
+await refused("a filename whose extension disagrees with the contents", { file_path: png, filename: "shot.jpg" }, /contents are image\/png/);
+await refused("a '..' workspace", { workspace: "..", file_path: png }, /slug/);
+rmSync(dir, { recursive: true, force: true });
 
 await client.close();
 if (failures) {
