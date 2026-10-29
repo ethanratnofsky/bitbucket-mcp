@@ -31,9 +31,15 @@
  *         DELETE .../pullrequests/{id}/approve          un-approve
  *         POST   .../pullrequests/{id}/request-changes  request changes
  *         DELETE .../pullrequests/{id}/request-changes  withdraw request-changes
+ *         POST   .../downloads                          upload ONE image (PNG/JPEG/GIF/
+ *                                                        WebP, <= 10 MiB) under a name
+ *                                                        DOWNLOAD_NAME_RE accepts — a
+ *                                                        timestamp + random prefix, so it
+ *                                                        can't replace an existing file
  *   - There is deliberately NO path that can merge, decline, delete a PR or a
  *     comment, change a PR's source branch / state / close_source_branch, create or
- *     delete branches, or change repository/workspace settings. Those endpoints
+ *     delete branches, delete or replace a download, or change repository/workspace
+ *     settings. Those endpoints
  *     (and body fields) are not in the allowlist, so bbWrite refuses them even if a
  *     future code change or a malicious prompt tries to build the request. The ids
  *     in each allowlisted path are constrained to digits. The workspace/repo
@@ -58,8 +64,8 @@
  *     So the path cannot be redirected to a sub-resource like /merge or /decline,
  *     or to another endpoint.
  *   - Inline/multi-line/mention/reply comments all ride on the SAME comments POST,
- *     so they do not widen the write boundary — it stays exactly the ten endpoints
- *     above.
+ *     so they do not widen the write boundary — it stays exactly the eleven
+ *     endpoints above.
  *   - Emoji reactions on comments are NOT supported: Bitbucket Cloud's public REST
  *     API has no reactions endpoint (only Bitbucket Data Center does).
  *
@@ -81,6 +87,9 @@
  *         write:pullrequest:bitbucket review actions (approve/request-changes),
  *                                     create PR, and update PR — omit to keep the
  *                                     token from changing PRs themselves
+ *         write:repository:bitbucket  upload_pull_request_image (Downloads POST) only —
+ *                                     optional. Bitbucket lets it do more (push, delete
+ *                                     downloads); this server exposes neither
  *       Read + comment set = the three read:* scopes (reads, plus posting, editing,
  *       and resolving comments). Read + write = add write:pullrequest.
  *
@@ -94,6 +103,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { realpathSync } from "node:fs";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { basename, extname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
@@ -127,6 +139,8 @@ const THREAD_ACTION = Object.freeze({ RESOLVE: "resolve", REOPEN: "reopen" });
 const TIMEOUT_MS = Number(process.env.BITBUCKET_TIMEOUT_MS) || 30_000;
 const MAX_RETRIES = 3; // GET only; writes are never auto-retried
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // upload_pull_request_image cap: plenty for a screenshot
+const MAX_NAME_STEM = 80; // characters kept from the caller's filename in an uploaded image's name
 
 // Regex source for a bare UUID (no braces), shared by toReviewer, the `slug`
 // input schema, and the write allowlist's path segments.
@@ -453,12 +467,98 @@ const isAllowedCommentUpdate = isCommentText;
 const PATH_SEGMENT = `(?:[A-Za-z0-9._-]+|%7[Bb]${UUID_SOURCE}%7[Dd])`;
 
 /**
+ * Build an anchored allowlist pattern for a path under one repository.
+ * @param {string} suffix - Regex source for what follows the repo segment, e.g. "/downloads".
+ * @returns {RegExp} `^/repositories/<segment>/<segment><suffix>$`.
+ */
+const repoRoute = (suffix) => new RegExp(`^/repositories/${PATH_SEGMENT}/${PATH_SEGMENT}${suffix}$`);
+
+/**
  * Build an anchored allowlist pattern for a path under one repository's
  * pullrequests collection.
  * @param {string} [suffix] - Regex source for what follows `/pullrequests`, e.g. String.raw`/\d+/approve`; "" for the collection itself.
  * @returns {RegExp} `^/repositories/<segment>/<segment>/pullrequests<suffix>$`.
  */
-const pullRequestRoute = (suffix = "") => new RegExp(`^/repositories/${PATH_SEGMENT}/${PATH_SEGMENT}/pullrequests${suffix}$`);
+const pullRequestRoute = (suffix = "") => repoRoute(`/pullrequests${suffix}`);
+
+// --- Images for upload_pull_request_image (repository Downloads). ---
+
+// The image types the upload accepts, recognized by their leading bytes (never
+// by the file's extension). `ext` is the one extension an uploaded name gets;
+// `aliases` are the extensions a caller's filename may already carry.
+const IMAGE_TYPES = Object.freeze({
+  png: { mime: "image/png", ext: "png", aliases: ["png"] },
+  jpeg: { mime: "image/jpeg", ext: "jpg", aliases: ["jpg", "jpeg"] },
+  gif: { mime: "image/gif", ext: "gif", aliases: ["gif"] },
+  webp: { mime: "image/webp", ext: "webp", aliases: ["webp"] },
+});
+const IMAGE_EXTENSIONS = new Set(Object.values(IMAGE_TYPES).flatMap((t) => t.aliases));
+
+// The only names an upload may carry: a UTC timestamp and 8 random hex digits in
+// front of the caller's (sanitized) name, as buildDownloadName makes them.
+// Bitbucket REPLACES a download that has the same name, so the allowlist itself
+// refuses any other name — an upload can't target an existing file by name.
+export const DOWNLOAD_NAME_RE = new RegExp(`^\\d{8}T\\d{6}Z-[0-9a-f]{8}-[A-Za-z0-9._-]{1,${MAX_NAME_STEM}}\\.(?:png|jpg|gif|webp)$`);
+
+/**
+ * Identify an image by its leading bytes.
+ * @param {Uint8Array} buf - File contents (at least the first 12 bytes).
+ * @returns {{ mime: string, ext: string, aliases: string[] }|null} the IMAGE_TYPES entry, or null for anything else.
+ */
+export const detectImageType = (buf) => {
+  const b = (i) => buf[i];
+  const ascii = (start, s) => [...s].every((c, i) => b(start + i) === c.charCodeAt(0));
+  if (buf.length >= 8 && [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((v, i) => b(i) === v)) return IMAGE_TYPES.png;
+  if (buf.length >= 3 && b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff) return IMAGE_TYPES.jpeg;
+  if (buf.length >= 6 && (ascii(0, "GIF87a") || ascii(0, "GIF89a"))) return IMAGE_TYPES.gif;
+  if (buf.length >= 12 && ascii(0, "RIFF") && ascii(8, "WEBP")) return IMAGE_TYPES.webp;
+  return null;
+};
+
+/**
+ * Build the unique name an image is uploaded under:
+ * `<YYYYMMDDTHHMMSSZ>-<8 hex>-<sanitized stem>.<ext>`. The stem keeps only
+ * [A-Za-z0-9._-] (other runs become "-") and at most MAX_NAME_STEM characters.
+ * The extension always matches the detected type.
+ * @param {string} requested - The caller's filename, or the local file's name.
+ * @param {{ ext: string, aliases: string[] }} type - The detected IMAGE_TYPES entry.
+ * @param {Date} [now] - Clock, for tests.
+ * @param {string} [rand] - 8 hex digits, for tests; random by default.
+ * @returns {string} a name that matches DOWNLOAD_NAME_RE.
+ * @throws {Error} when the requested name has an image extension that disagrees with the contents.
+ */
+export const buildDownloadName = (requested, type, now = new Date(), rand = randomBytes(4).toString("hex")) => {
+  const base = basename(String(requested));
+  const ext = extname(base).slice(1).toLowerCase();
+  const isImageExt = IMAGE_EXTENSIONS.has(ext);
+  if (isImageExt && !type.aliases.includes(ext)) {
+    throw new Error(`The filename ends in .${ext}, but the file's contents are ${type.mime}. Rename it (or omit the extension).`);
+  }
+  const stem =
+    (isImageExt ? base.slice(0, -(ext.length + 1)) : base)
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .slice(0, MAX_NAME_STEM)
+      .replace(/^[-.]+|[-.]+$/g, "") || "image";
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  return `${stamp}-${rand}-${stem}.${type.ext}`;
+};
+
+/**
+ * Form rule for `POST .../downloads`: exactly one `files` entry, an image of an
+ * accepted type and size, under a name DOWNLOAD_NAME_RE accepts whose extension
+ * matches its type.
+ * @param {unknown} form - The FormData bbWrite is about to send.
+ * @returns {boolean} true only for a single uniquely-named image upload.
+ */
+export const isAllowedDownloadUpload = (form) => {
+  if (!(form instanceof FormData)) return false;
+  const entries = [...form.entries()];
+  if (entries.length !== 1) return false;
+  const [key, file] = entries[0];
+  if (key !== "files" || !(file instanceof Blob) || typeof file.name !== "string") return false;
+  const type = Object.values(IMAGE_TYPES).find((t) => t.mime === file.type);
+  return Boolean(type) && DOWNLOAD_NAME_RE.test(file.name) && file.name.endsWith(`.${type.ext}`) && file.size > 0 && file.size <= MAX_IMAGE_BYTES;
+};
 
 /**
  * The set of write endpoints this server may touch. Each entry is a (method,
@@ -481,45 +581,68 @@ const WRITE_ALLOWLIST = [
   { method: "DELETE", re: pullRequestRoute(String.raw`/\d+/approve`), what: "un-approve PR" },
   { method: "POST", re: pullRequestRoute(String.raw`/\d+/request-changes`), what: "request changes on PR" },
   { method: "DELETE", re: pullRequestRoute(String.raw`/\d+/request-changes`), what: "withdraw request-changes on PR" },
+  { method: "POST", re: repoRoute("/downloads"), multipart: true, body: isAllowedDownloadUpload, what: "upload a uniquely-named image to repository Downloads" },
 ];
 
 /**
  * Pure predicate behind the write boundary: the method and path — and, for
  * entries with a body rule, the request body — must all match one allowlist
  * entry, and the path must be a string that survives URL parsing unchanged
- * (isCanonicalPath). Exported so the boundary can be exercised by tests without
- * making any network call.
+ * (isCanonicalPath). A FormData body matches only a `multipart` entry, and a
+ * `multipart` entry matches only a FormData body, so a form can't ride on a
+ * JSON endpoint whose entry has no body rule. Exported so the boundary can be
+ * exercised by tests without making any network call.
  * @param {string} method - HTTP method; only POST, PUT, and DELETE can ever pass.
  * @param {string} path - Request path relative to /2.0, already percent-encoded.
- * @param {unknown} [body] - The parsed JSON body to send; checked only by entries with a body rule.
+ * @param {unknown} [body] - The parsed JSON body, or the FormData, to send; checked only by entries with a body rule.
  * @returns {boolean} whether bbWrite may send this request.
  */
 export function isWriteAllowed(method, path, body) {
   if (!WRITE_METHODS.has(method) || !isCanonicalPath(path)) return false;
-  return WRITE_ALLOWLIST.some((e) => e.method === method && e.re.test(path) && (!e.body || e.body(body)));
+  const multipart = body instanceof FormData;
+  return WRITE_ALLOWLIST.some((e) => e.method === method && e.re.test(path) && Boolean(e.multipart) === multipart && (!e.body || e.body(body)));
 }
 
 /**
- * Validate a write and produce exactly what will be sent. The body is serialized
- * FIRST and the parsed result is what gets checked, so a toJSON() or getter can't
- * make the checked object differ from the bytes on the wire; and `path` must be a
- * primitive string, so it can't stringify differently when the URL is built.
+ * Copy a FormData entry by entry, so the copy that is checked is the one that is
+ * sent and later changes to the caller's object can't reach the wire.
+ * @param {FormData} form - The caller's form.
+ * @returns {FormData} a new form with the same entries (files keep their names).
+ */
+const copyForm = (form) => {
+  const out = new FormData();
+  for (const [k, v] of form.entries()) {
+    if (typeof v === "string") out.append(k, v);
+    else out.append(k, v, v.name);
+  }
+  return out;
+};
+
+/**
+ * Validate a write and produce exactly what will be sent. A JSON body is
+ * serialized FIRST and the parsed result is what gets checked, so a toJSON() or
+ * getter can't make the checked object differ from the bytes on the wire; a
+ * FormData body is copied first and the copy is checked and sent. `path` must be
+ * a primitive string, so it can't stringify differently when the URL is built.
  * Exported for tests (pure — no network).
  * @param {string} method - HTTP method.
  * @param {string} path - Request path relative to /2.0.
- * @param {unknown} [body] - The request body; omitted for bodiless writes.
- * @returns {{ url: string, json: string|undefined }} the full URL and the exact JSON text to send.
+ * @param {unknown} [body] - The request body (JSON-able object or FormData); omitted for bodiless writes.
+ * @returns {{ url: string, json: string|undefined, form: FormData|undefined }} the full URL and the exact
+ *   JSON text or form to send.
  * @throws {Error} when the request is outside the write allowlist.
  */
 export const prepareWrite = (method, path, body) => {
-  const json = body === undefined ? undefined : JSON.stringify(body);
-  if (!isWriteAllowed(method, path, json === undefined ? undefined : JSON.parse(json))) {
+  const form = body instanceof FormData ? copyForm(body) : undefined;
+  const json = body === undefined || form ? undefined : JSON.stringify(body);
+  const checked = form ?? (json === undefined ? undefined : JSON.parse(json));
+  if (!isWriteAllowed(method, path, checked)) {
     const shown = typeof path === "string" ? path : "(a non-string path)"; // never stringify a refused non-string
     throw new Error(
-      `bbWrite refuses ${method} ${shown}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, and a PR update may change only title, description, reviewers, draft, and destination branch.`
+      `bbWrite refuses ${method} ${shown}: not in the write allowlist (or the body has a field it may not send). This server cannot merge, decline, or delete, a PR update may change only title, description, reviewers, draft, and destination branch, and an upload must be one uniquely-named image.`
     );
   }
-  return { url: BASE + path, json };
+  return { url: BASE + path, json, form };
 };
 
 /**
@@ -531,16 +654,18 @@ export const prepareWrite = (method, path, body) => {
  * never be transparently redirected with creds attached. Writes are never retried.
  * @param {"POST"|"PUT"|"DELETE"} method - HTTP method.
  * @param {string} path - Request path relative to /2.0, built from enc()-encoded segments.
- * @param {{ body?: object }} [options] - `body` is sent as JSON.
+ * @param {{ body?: object|FormData }} [options] - `body` is sent as JSON, or as multipart/form-data when it is a FormData.
  * @returns {Promise<object|string|null>} the parsed JSON response; the raw text if it isn't JSON;
  *   null for a 204 / empty response (DELETE).
  * @throws {Error} when the request is outside the allowlist or Bitbucket answers with a redirect;
  *   {BitbucketError} for any other non-2xx status.
  */
 async function bbWrite(method, path, { body } = {}) {
-  const { url, json } = prepareWrite(method, path, body);
+  const { url, json, form } = prepareWrite(method, path, body);
   const init = { method, headers: { Authorization: AUTH, Accept: "application/json" }, redirect: "manual" };
-  if (json !== undefined) {
+  if (form) {
+    init.body = form; // fetch sets the multipart Content-Type and boundary itself
+  } else if (json !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = json;
   }
@@ -690,6 +815,56 @@ const findThreadRootId = async (commentsPath, comment) => {
   }
   return c.id;
 };
+/**
+ * Read a local image for upload_pull_request_image, refusing anything that
+ * isn't a regular, non-empty file of at most MAX_IMAGE_BYTES whose contents are
+ * PNG, JPEG, GIF, or WebP. Symlinks are followed (the target is what's checked
+ * and read). The contents check means only images can leave the machine.
+ * @param {string} filePath - Absolute local path.
+ * @returns {Promise<{ buf: Buffer, type: { mime: string, ext: string, aliases: string[] } }>} the bytes and detected type.
+ * @throws {Error} with a plain explanation for every refusal.
+ */
+export async function readImageFile(filePath) {
+  if (typeof filePath !== "string" || !isAbsolute(filePath)) throw new Error(`file_path must be an absolute path (got ${JSON.stringify(filePath)}).`);
+  let real;
+  try {
+    real = await realpath(filePath);
+  } catch (e) {
+    throw new Error(e?.code === "ENOENT" ? `No file at ${filePath}.` : `Cannot open ${filePath}: ${e?.code || e?.message || e}`);
+  }
+  const st = await stat(real);
+  if (!st.isFile()) throw new Error(`${filePath} is not a regular file.`);
+  if (st.size === 0) throw new Error(`${filePath} is empty.`);
+  if (st.size > MAX_IMAGE_BYTES) throw new Error(`${filePath} is ${st.size} bytes; the limit is ${MAX_IMAGE_BYTES} (10 MiB).`);
+  const buf = await readFile(real);
+  if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) throw new Error(`${filePath} changed size while being read; try again.`);
+  const type = detectImageType(buf);
+  if (!type) throw new Error(`${filePath} is not a PNG, JPEG, GIF, or WebP image (checked by its contents, not its extension).`);
+  return { buf, type };
+}
+
+/**
+ * Whether the repository already has a download with this name. A GET to the
+ * API origin only: Bitbucket answers 302 (to the file's storage URL) when it
+ * exists and 404 when it doesn't. The redirect is NOT followed, so the
+ * Authorization header never leaves api.bitbucket.org.
+ * @param {string} workspace - Workspace slug.
+ * @param {string} repo - Repository slug.
+ * @param {string} name - Download filename.
+ * @returns {Promise<boolean>} true when it exists.
+ * @throws {BitbucketError} for any status other than 2xx, 3xx, or 404.
+ */
+async function downloadExists(workspace, repo, name) {
+  const path = `/repositories/${enc(workspace)}/${enc(repo)}/downloads/${enc(name)}`;
+  const res = await doFetch(BASE + path, { method: "GET", headers: { Authorization: AUTH }, redirect: "manual" }, { retry: true });
+  if (res.status === 404 || (res.status >= 200 && res.status < 400)) {
+    await res.body?.cancel?.().catch(() => {});
+    return res.status !== 404;
+  }
+  const body = await res.text().catch(() => "");
+  throw new BitbucketError(res.status, res.statusText, path, body);
+}
+
 
 /** Resolve a branch name to its head commit hash (so paths with slashes in the
  *  branch name don't break the Source API). Returns null if it can't resolve. */
@@ -1035,7 +1210,7 @@ const wrap = (fn) => async (args) => {
 const SLUG_PATTERN = new RegExp(`^(?:\\{${UUID_SOURCE}\\}|(?!\\.\\.?$)[A-Za-z0-9._-]+)$`);
 export const slug = z.string().regex(SLUG_PATTERN, "must be a Bitbucket slug (letters, digits, '.', '_', '-'; not '.' or '..') or a {uuid}");
 
-export const server = new McpServer({ name: "Bitbucket", version: "2.2.1" });
+export const server = new McpServer({ name: "Bitbucket", version: "2.3.0" });
 
 // ============================ READ TOOLS ============================
 
@@ -1748,6 +1923,66 @@ server.registerTool(
   })
 );
 
+server.registerTool(
+  "upload_pull_request_image",
+  {
+    title: "Upload an image for a PR description",
+    description:
+      "Upload a local screenshot (PNG, JPEG, GIF, or WebP; at most 10 MiB) to the repository's Downloads, so it can be embedded in a PR description or comment without committing it. " +
+      "Returns the image's URL and a ready-to-paste Markdown snippet ('markdown') — put it in update_pull_request's or create_pull_request's 'description'. " +
+      "The file gets a new, unique name (UTC timestamp + random suffix + your filename), so it never replaces an existing download. " +
+      "Anyone who can read the repository can see it. This tool cannot delete an upload; a repo admin can remove it under Repository settings → Downloads.",
+    inputSchema: {
+      workspace: slug,
+      repo: slug,
+      file_path: z.string().refine(isAbsolute, "must be an absolute path").describe("Absolute path to the local image file"),
+      filename: z.string().min(1).max(200).optional().describe("Name to upload under (defaults to the local file's name). Sanitized to letters, digits, '.', '_', '-', and prefixed to be unique; the extension is set from the file's contents."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  /**
+   * Validate and read the image, pick a name no download has, POST it to
+   * .../downloads as multipart, then confirm it's there.
+   * @param {{ workspace: string, repo: string, file_path: string, filename?: string }} args - Validated tool input.
+   * @returns {Promise<object>} the tool result: `{ filename, url, markdown, content_type, size_bytes, note }`.
+   *   isError when no unused name could be found; readImageFile / buildDownloadName / Bitbucket errors
+   *   propagate to wrap().
+   */
+  wrap(async ({ workspace, repo, file_path, filename }) => {
+    const { buf, type } = await readImageFile(file_path);
+    const requested = filename ?? basename(file_path);
+    let candidate = buildDownloadName(requested, type); // throws on a mismatched extension, before any request
+    const repoPath = `/repositories/${enc(workspace)}/${enc(repo)}`;
+    const info = await bbGet(repoPath);
+    const html = info?.links?.html?.href;
+    const webBase = typeof html === "string" && html.startsWith("https://bitbucket.org/") ? html.replace(/\/+$/, "") : `https://bitbucket.org/${enc(workspace)}/${enc(repo)}`;
+
+    let name;
+    for (let attempt = 0; attempt < 3 && !name; attempt++) {
+      if (attempt > 0) candidate = buildDownloadName(requested, type);
+      if (!(await downloadExists(workspace, repo, candidate))) name = candidate;
+    }
+    if (!name) return fail("[bitbucket-mcp] Could not find an unused download name after 3 tries; nothing was uploaded.");
+
+    const form = new FormData();
+    form.append("files", new Blob([buf], { type: type.mime }), name);
+    await bbWrite("POST", `${repoPath}/downloads`, { body: form });
+    const confirmed = await downloadExists(workspace, repo, name);
+
+    const url = `${webBase}/downloads/${enc(name)}`;
+    const alt = basename(requested, extname(requested)).replace(/[[\]\\]/g, "").trim() || "screenshot";
+    return ok({
+      filename: name,
+      url,
+      markdown: `![${alt}](${url})`,
+      content_type: type.mime,
+      size_bytes: buf.length,
+      ...(confirmed ? {} : { warning: "Bitbucket accepted the upload but the file isn't listed yet; check the URL before relying on it." }),
+      note: "Visible to anyone who can read this repository. This server cannot delete it; a repo admin can, under Repository settings → Downloads.",
+    });
+  })
+);
+
 // Connect to stdio only when run directly (`node server.js` or via the npm bin
 // symlink). When imported by a test, this is skipped so the module loads without
 // holding the transport open. realpathSync resolves the bin symlink to this file.
@@ -1762,5 +1997,5 @@ const invokedDirectly = (() => {
 if (invokedDirectly) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("[bitbucket-mcp] MCP server running (read + PR comment/thread/review/create/update tools).\n");
+  process.stderr.write("[bitbucket-mcp] MCP server running (read + PR comment/thread/review/create/update + image upload tools).\n");
 }

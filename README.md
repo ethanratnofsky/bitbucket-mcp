@@ -1,6 +1,6 @@
 # bitbucket-mcp
 
-A Bitbucket Cloud MCP server you run yourself. It gives Claude Code and Claude Desktop a set of **read** tools (pull requests, diffs, repositories, branches, files, PR templates, workspace members, comment threads) plus a small, audited set of **pull-request write** tools: comment (general, inline, **multi-line**, **@-mention**, or **reply**), **edit your own comments**, **resolve / reopen comment threads**, take a review action (approve / request changes / withdraw), create a pull request, and **update a pull request** (title, description, reviewers, draft ↔ ready, destination branch).
+A Bitbucket Cloud MCP server you run yourself. It gives Claude Code and Claude Desktop a set of **read** tools (pull requests, diffs, repositories, branches, files, PR templates, workspace members, comment threads) plus a small, audited set of **pull-request write** tools: comment (general, inline, **multi-line**, **@-mention**, or **reply**), **edit your own comments**, **resolve / reopen comment threads**, take a review action (approve / request changes / withdraw), create a pull request, and **update a pull request** (title, description, reviewers, draft ↔ ready, destination branch). It can also **upload a screenshot** to the repository's Downloads so you can embed it in a PR description without committing it.
 
 ## Why this exists / capability boundary
 
@@ -21,8 +21,9 @@ This is the "build it yourself" option, so the capability boundary lives in code
   | `DELETE` | `.../pullrequests/{id}/approve` | un-approve |
   | `POST` | `.../pullrequests/{id}/request-changes` | request changes |
   | `DELETE` | `.../pullrequests/{id}/request-changes` | withdraw request-changes |
+  | `POST` | `.../downloads` | upload **one** image (PNG, JPEG, GIF, or WebP; at most 10 MiB, multipart field `files`) whose name carries a UTC timestamp and random prefix — see [`upload_pull_request_image`](#upload_pull_request_image--screenshots-in-a-pr-description) |
 
-  Inline, multi-line, @-mention, and reply comments all use that single comments `POST` — they add request-body fields, not new endpoints — so the write boundary stays exactly these ten.
+  Inline, multi-line, @-mention, and reply comments all use that single comments `POST` — they add request-body fields, not new endpoints — so the write boundary stays exactly these eleven. A multipart body matches only the downloads entry, and the downloads entry matches only a multipart body, so a form can't ride on a JSON endpoint.
 
 - **PUT bodies are field- and type-allowlisted too.** Bitbucket's update-PR endpoint accepts the whole pull-request document, so the path alone isn't a tight enough boundary. `bbWrite()` refuses an update whose body carries any other field — `state`, `source`, `close_source_branch`, `merge_commit`, … — or an allowed field of the wrong type:
   - `title` and `description` must be strings and `draft` a boolean.
@@ -30,7 +31,7 @@ This is the "build it yourself" option, so the capability boundary lives in code
   - `destination` must be exactly `{ branch: { name } }`, never a different repository or commit.
 
   A comment edit may carry only `{ content: { raw: <string> } }`, so it can't re-anchor or re-parent a comment.
-- **What it deliberately cannot do.** There is **no** path that can **merge, decline, delete a PR or a comment, change a PR's source branch / state / close-source-branch setting, delete or create branches, delete a repository, or change settings**. Those endpoints and fields are not in the allowlist, so `bbWrite()` rejects them even if a future code change or a malicious prompt tries to construct the request. The allowlist patterns are anchored and the PR and comment id segments are constrained to digits. The workspace/repo segments can't escape their place in the path:
+- **What it deliberately cannot do.** There is **no** path that can **merge, decline, delete a PR or a comment, change a PR's source branch / state / close-source-branch setting, delete or create branches, delete or replace a download, delete a repository, or change settings**. Those endpoints and fields are not in the allowlist, so `bbWrite()` rejects them even if a future code change or a malicious prompt tries to construct the request. The allowlist patterns are anchored and the PR and comment id segments are constrained to digits. The workspace/repo segments can't escape their place in the path:
   - **A slash, a `%` escape (single- or double-encoded), or any character outside `[A-Za-z0-9._-]`** (other than the braces of a `{uuid}`, which both layers accept) is refused at **two** layers:
     - the `slug` input schema;
     - the allowlist's own segment pattern, which admits only those characters or a UUID percent-encoded in braces (`%7B…%7D`).
@@ -44,14 +45,14 @@ This is the "build it yourself" option, so the capability boundary lives in code
   So the path that was checked is exactly the path that is sent, and it can't be redirected to a different sub-resource like `/merge` or to another endpoint entirely. The body that was checked is likewise exactly the JSON that is sent, because `bbWrite()` serializes first and validates the parsed result. It also requires the path to be a primitive string, so it can't stringify differently when the URL is built.
 - **No emoji reactions.** Bitbucket Cloud's public REST API has no endpoint for reacting to comments (only Bitbucket Data Center has one), so this server can't add reactions. It deliberately doesn't use the undocumented endpoint the Bitbucket web UI calls: that's unsupported, can change without notice, and would sit outside the allowlist design.
 - **The boundary is tested.** `npm test` runs three suites, none of which touch the network:
-  - `test.mjs` asserts the allowlist permits the ten writes above. It refuses merge, decline, delete, wrong-method, traversal, dot-segment, and encoded-separator attempts, plus `PUT` bodies with an extra field or a field of the wrong type. It also checks that what's validated is exactly what's sent (`prepareWrite`). It tests `isCanonicalPath` on its own, so its job stays covered even if the allowlist pattern changes. That job is dot segments, backslashes, `%2F` / `%5C` / `%2E`, a query or fragment, and any raw character the URL parser would rewrite (a space, brace, double quote, tab, non-ASCII). It does *not* refuse what the parser leaves alone: other percent-escapes (`%252F`, `%3B`) and raw characters like `'` `!` `*` `(` `)` `~` `;` `@`. Percent-encoding leaves `' ! * ( ) ~` as they are, so only `slug` and the segment pattern stop those. And it tests `findFieldWithoutRule`, the helper behind the startup check that every sendable PR field has a type rule.
+  - `test.mjs` asserts the allowlist permits the eleven writes above. It refuses merge, decline, delete, wrong-method, traversal, dot-segment, and encoded-separator attempts, plus `PUT` bodies with an extra field or a field of the wrong type, and uploads that aren't one uniquely-named image (wrong name, type, size, field, or file count; a form sent to a JSON endpoint). It also checks that what's validated is exactly what's sent (`prepareWrite`). It tests `isCanonicalPath` on its own, so its job stays covered even if the allowlist pattern changes. That job is dot segments, backslashes, `%2F` / `%5C` / `%2E`, a query or fragment, and any raw character the URL parser would rewrite (a space, brace, double quote, tab, non-ASCII). It does *not* refuse what the parser leaves alone: other percent-escapes (`%252F`, `%3B`) and raw characters like `'` `!` `*` `(` `)` `~` `;` `@`. Percent-encoding leaves `' ! * ( ) ~` as they are, so only `slug` and the segment pattern stop those. And it tests `findFieldWithoutRule`, the helper behind the startup check that every sendable PR field has a type rule.
   - `test-tools.mjs` confirms every tool registers with a valid schema, that only the write tools drop the `readOnlyHint` annotation, and that every tool's `workspace`/`repo` input enforces the slug rule.
-  - `test-handlers.mjs` calls the PR-update and comment-thread tools through an MCP client against a fake Bitbucket. It asserts the exact requests each one sends, and that refused and no-op calls send no write at all.
+  - `test-handlers.mjs` calls the PR-update, comment-thread, and image-upload tools through an MCP client against a fake Bitbucket. It asserts the exact requests each one sends, and that refused and no-op calls send no write at all.
 - **Pinned dependencies.** Only `@modelcontextprotocol/sdk` and `zod`, both pinned to exact versions. Install once and run your reviewed copy.
 - **Credentials stay local.** Read from the environment, used only for the `Authorization` header, never logged or sent elsewhere.
 - **Robust by default.** Every request has a timeout (`BITBUCKET_TIMEOUT_MS`, default 30s) so a stalled connection can't hang the server. Reads (`GET`) retry with backoff on `429`/`502`/`503`/`504`, honoring `Retry-After`; writes are **never** auto-retried (a retried `POST` could double-post a comment or PR). List/comment reads auto-paginate up to a bounded number of pages and report `has_more`.
 
-The token's `pullrequest` write scope (required by Bitbucket to review, create, or update a PR) would, in general, also permit merge and decline — but this server is the boundary: it exposes only the ten writes above, never merge, decline, or delete, even when prompted to.
+The token's `pullrequest` write scope (required by Bitbucket to review, create, or update a PR) would, in general, also permit merge and decline — but this server is the boundary: it exposes only the eleven writes above, never merge, decline, or delete, even when prompted to. The same holds for the optional `write:repository:bitbucket` scope that the image upload needs. Bitbucket lets that scope push code and delete downloads, but this server only uploads new, uniquely-named images.
 
 ## Prerequisites
 
@@ -79,6 +80,12 @@ read:workspace:bitbucket
 write:pullrequest:bitbucket
 ```
 
+**Optional: image upload.** Add this scope only if you want `upload_pull_request_image`. Without it, that tool returns 403 and everything else still works:
+
+```
+write:repository:bitbucket
+```
+
 What each scope covers in this server:
 
 | Scope | Tools / calls it enables |
@@ -87,6 +94,7 @@ What each scope covers in this server:
 | `read:repository:bitbucket` | `get_file`, `list_directory`, `get_pull_request_template`, `list_repositories`, `list_branches`, repo lookups, **and the diff/diffstat 302 redirect target** — the diff tool 403s on the redirect without it, *even with* the PR scope |
 | `read:workspace:bitbucket` | `list_workspace_members` (look up account_ids to @-mention or add as reviewers) |
 | `write:pullrequest:bitbucket` | `review_pull_request` (approve / request-changes / withdraw), `create_pull_request`, and `update_pull_request` |
+| `write:repository:bitbucket` | `upload_pull_request_image` (the Downloads `POST`). Its name-is-free check and the repo lookup use `read:repository:bitbucket` |
 
 Notes:
 
@@ -159,6 +167,7 @@ Fully quit and relaunch Claude Desktop (config changes load only on a full resta
 | `review_pull_request` | **write** | Approve, request changes, or withdraw either |
 | `create_pull_request` | **write** | Open a PR (auto-applies a repo PR template when no description is given) |
 | `update_pull_request` | **write** | Edit an open PR: title, description, add/remove reviewers, draft ↔ ready, destination branch |
+| `upload_pull_request_image` | **write** | Upload a local screenshot to the repo's Downloads under a new unique name; returns its URL and a `![alt](url)` snippet for a PR description |
 
 Every tool carries MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations): read tools are marked `readOnlyHint: true`; write tools state `destructiveHint` (true only for the two that overwrite content: `update_pull_request` and `update_pull_request_comment`) and `idempotentHint`, so a client can decide how carefully to confirm each call.
 
@@ -223,6 +232,18 @@ The tool reads the PR first, then always sends its current title, description, a
 
 One limit: Bitbucket documents no way to make an update conditional on the PR not having changed, so the read and the write are separate requests. If someone else edits the description, or adds or removes a reviewer, in the moment between them, this update overwrites their change. The tripwire can't catch this, because its "before" is the PR as it was read. Re-read the PR with `get_pull_request` afterwards if others are actively editing it.
 
+### `upload_pull_request_image` — screenshots in a PR description
+
+Uploads one local image to the repository's [Downloads](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-downloads/) (`POST /2.0/repositories/{workspace}/{repo}/downloads`, multipart). This lets you embed a screenshot without committing it to a branch.
+
+- Inputs: `workspace`, `repo`, `file_path` (absolute), and an optional `filename`.
+- The file must be a regular, non-empty file of at most 10 MiB, and its **contents** must be PNG, JPEG, GIF, or WebP. The extension doesn't decide this. SVG is refused. Symlinks are followed.
+- The upload name is `<UTC YYYYMMDDTHHMMSSZ>-<8 random hex>-<your name>.<ext>`. Your name is cut down to letters, digits, `.`, `_`, `-`, and at most 80 characters. The extension comes from the contents. A filename whose image extension disagrees with the contents (`shot.jpg` for a PNG) is refused.
+- **It never replaces an existing file.** Bitbucket replaces a download that has the same name. So the tool first checks that the name is free, and tries a new random suffix if it's taken (three tries at most). The allowlist also refuses any upload name without the timestamp-and-random prefix.
+- Returns `url` (`https://bitbucket.org/{workspace}/{repo}/downloads/{name}`) and `markdown` (`![alt](url)`). Paste the snippet into `update_pull_request`'s or `create_pull_request`'s `description`.
+- Anyone who can read the repository can see the image. This server cannot delete it. A repo admin can, under **Repository settings → Downloads**.
+- Needs `write:repository:bitbucket` (see [Token scopes](#token-scopes-exact)).
+
 ## Verify
 
 Read path:
@@ -252,6 +273,10 @@ Thread path:
 Update path:
 
 > on PR 123, rename it to "Add X (behind flag)", add Jane as a reviewer, and mark it ready for review
+
+Image path:
+
+> upload `/Users/me/Desktop/login-after.png` to `acme/frontend-app` and add it under "Screenshots" in PR 123's description
 
 Review path:
 
